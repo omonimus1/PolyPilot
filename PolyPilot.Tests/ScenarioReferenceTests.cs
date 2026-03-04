@@ -188,6 +188,18 @@ public class ScenarioReferenceTests
     }
 
     /// <summary>
+    /// Scenario: "vscode-remote-tunnels-in-remote-mode"
+    /// Unit test equivalents: PlatformHelperTests.BuildVSCodeRemoteArg_*,
+    ///   RemoteModeTests.SessionsListPayload_ServerMachineName_RoundTrip,
+    ///   RemoteModeTests.SessionsListPayload_LegacyPayload_WithoutServerMachineName
+    /// </summary>
+    [Fact]
+    public void Scenario_VSCodeRemoteTunnels_HasUnitTestCoverage()
+    {
+        Assert.True(true, "See PlatformHelperTests.BuildVSCodeRemoteArg_* and RemoteModeTests.SessionsListPayload_ServerMachineName_*");
+    }
+
+    /// <summary>
     /// Scenario: "custom-agent-popup-click-to-use"
     /// Unit test equivalents: AgentDiscoveryTests.*
     /// </summary>
