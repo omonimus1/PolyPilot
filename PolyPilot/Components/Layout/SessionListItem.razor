@@ -187,6 +187,12 @@
                         🔧 Fix with Copilot
                     </button>
                 }
+                @if (PlatformHelper.IsDesktop && !string.IsNullOrEmpty(Session.SessionId))
+                {
+                    <button class="menu-item" @onclick="async () => { await OnCloseMenu.InvokeAsync(); await OnAnalyze.InvokeAsync(); }">
+                        📊 Analyze Efficiency
+                    </button>
+                }
                 <div class="menu-separator"></div>
                 @if (PlatformHelper.IsDesktop && !string.IsNullOrEmpty(Session.SessionId))
                 {
@@ -231,6 +237,7 @@
     [Parameter] public EventCallback OnCloseMenu { get; set; }
     [Parameter] public EventCallback OnReportBug { get; set; }
     [Parameter] public EventCallback OnFixWithCopilot { get; set; }
+    [Parameter] public EventCallback OnAnalyze { get; set; }
 
     /// <summary>
     /// Show close confirmation via a JS-created dialog (outside Blazor's DOM tree).
