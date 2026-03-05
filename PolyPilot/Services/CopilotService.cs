@@ -1626,9 +1626,13 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         info.SessionId = copilotSession.SessionId;
         info.IsCreating = false;
 
-        // Session was closed while we were awaiting SDK creation -- dispose and bail
+        // Session was closed while we were awaiting SDK creation -- dispose and bail.
+        // Clean up any queued messages/images/modes so they don't leak to a future session with the same name.
         if (!_sessions.ContainsKey(name))
         {
+            state.Info.MessageQueue.Clear();
+            _queuedImagePaths.TryRemove(name, out _);
+            _queuedAgentModes.TryRemove(name, out _);
             try { await copilotSession.DisposeAsync(); } catch { }
             return info;
         }
@@ -1654,6 +1658,55 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         // Track session creation using display name as stable key
         // (SessionId may not be populated yet at creation time)
         _usageStats?.TrackSessionStart(name);
+
+        // Drain any messages queued while IsCreating was true.
+        // The user may have typed and sent a message before SDK creation finished.
+        if (state.Info.MessageQueue.Count > 0)
+        {
+            var nextPrompt = state.Info.MessageQueue[0];
+            state.Info.MessageQueue.RemoveAt(0);
+            List<string>? nextImagePaths = null;
+            lock (_imageQueueLock)
+            {
+                if (_queuedImagePaths.TryGetValue(name, out var imageQueue) && imageQueue.Count > 0)
+                {
+                    nextImagePaths = imageQueue[0];
+                    imageQueue.RemoveAt(0);
+                    if (imageQueue.Count == 0)
+                        _queuedImagePaths.TryRemove(name, out _);
+                }
+            }
+            string? nextAgentMode = null;
+            lock (_imageQueueLock)
+            {
+                if (_queuedAgentModes.TryGetValue(name, out var modeQueue) && modeQueue.Count > 0)
+                {
+                    nextAgentMode = modeQueue[0];
+                    modeQueue.RemoveAt(0);
+                    if (modeQueue.Count == 0)
+                        _queuedAgentModes.TryRemove(name, out _);
+                }
+            }
+            Debug($"[CREATE] Draining queued message for newly created session '{name}'");
+            _ = SendPromptAsync(name, nextPrompt, imagePaths: nextImagePaths, agentMode: nextAgentMode)
+                .ContinueWith(t =>
+                {
+                    if (t.IsFaulted)
+                    {
+                        var errorMsg = t.Exception?.InnerException?.Message ?? t.Exception?.Message ?? "unknown error";
+                        Debug($"[CREATE] Failed to send queued message for '{name}': {errorMsg}");
+                        InvokeOnUI(() =>
+                        {
+                            if (_sessions.TryGetValue(name, out var s))
+                            {
+                                s.Info.History.Add(ChatMessage.ErrorMessage($"Failed to send queued message: {errorMsg}"));
+                                s.Info.MessageCount = s.Info.History.Count;
+                                OnStateChanged?.Invoke();
+                            }
+                        });
+                    }
+                }, TaskContinuationOptions.OnlyOnFaulted);
+        }
         
         return info;
     }
