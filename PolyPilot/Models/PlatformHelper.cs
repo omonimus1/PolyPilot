@@ -7,8 +7,11 @@ public static class PlatformHelper
     public static bool IsDesktop =>
 #if MACCATALYST || WINDOWS
         true;
-#else
+#elif IOS || ANDROID
         false;
+#else
+        // Linux GTK and other non-mobile platforms are desktop
+        !OperatingSystem.IsIOS() && !OperatingSystem.IsAndroid();
 #endif
 
     public static bool IsMobile =>
@@ -16,6 +19,19 @@ public static class PlatformHelper
         true;
 #else
         false;
+#endif
+
+    public static string PlatformName =>
+#if MACCATALYST
+        "maccatalyst";
+#elif WINDOWS
+        "windows";
+#elif IOS
+        "ios";
+#elif ANDROID
+        "android";
+#else
+        OperatingSystem.IsLinux() ? "linux" : "unknown";
 #endif
 
     public static ConnectionMode[] AvailableModes => IsDesktop

@@ -494,6 +494,18 @@ a, .btn-link {
     padding-top: 1.1rem;
 }
 
+/* Settings route: single scroll container to avoid nested-scroll clipping on GTK/WebKit.
+   Scoped via body[data-platform="linux"] to avoid affecting Mac/Windows. */
+body[data-platform="linux"] .content.settings-content-active {
+    overflow-y: auto !important;
+}
+
+body[data-platform="linux"] .content.settings-content-active .settings-page {
+    height: auto !important;
+    min-height: 100%;
+    overflow-y: visible !important;
+}
+
 h1:focus {
     outline: none;
 }

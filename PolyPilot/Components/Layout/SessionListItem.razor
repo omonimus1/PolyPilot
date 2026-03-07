@@ -8,6 +8,8 @@
 @{
     var isPinned = Meta?.IsPinned ?? false;
     var sessionDir = GetSessionDirectory();
+    var provider = CopilotService.GetProviderForSession(Session.Name);
+    var providerDisplayName = CopilotService.GetProviderSessionDisplayName(Session.Name);
     var cssClass = IsActive ? "active" : 
                    IsCompleted ? "completed" :
                    Session.IsProcessing ? "busy" : "";
@@ -20,9 +22,12 @@
         : 0;
     var contextColor = contextPct > 85 ? "var(--accent-primary)" : contextPct > 60 ? "#fbbf24" : "var(--accent-success)";
 }
-<div class="session-item @cssClass @(isPinned ? "pinned" : "")"
+<div class="session-item @cssClass @(isPinned ? "pinned" : "") @(provider != null ? "provider-session" : "")"
      data-session-name="@Session.Name"
-     @onclick="() => OnSelect.InvokeAsync()">
+     style="@(provider != null ? $"border-left: 3px solid {provider.AccentColor};" : "")"
+     @onclick="() => OnSelect.InvokeAsync()"
+     @oncontextmenu="OpenContextMenu"
+     @oncontextmenu:preventDefault="true">
     <div class="session-info">
         <span class="session-name">
             @if (ShortcutIndex is > 0 and <= 9)
@@ -42,12 +47,17 @@
                 <input type="text" class="rename-input" id="renameInput"
                        value="@Session.Name"
                        @onclick:stopPropagation="true"
+                       @oncontextmenu:stopPropagation="true"
                        @onblur="() => OnCommitRename.InvokeAsync()"
                        @onkeyup="HandleRenameKeyUp" />
             }
             else
             {
-                <span class="session-name-text" @ondblclick="() => OnStartRename.InvokeAsync()" @ondblclick:stopPropagation="true">@Session.Name</span>
+                @if (provider != null)
+                {
+                    <span class="provider-icon" title="@provider.DisplayName">@provider.Icon</span>
+                }
+                <span class="session-name-text" @ondblclick="() => OnStartRename.InvokeAsync()" @ondblclick:stopPropagation="true">@(providerDisplayName ?? Session.Name)</span>
                 @if (Meta?.Role == MultiAgentRole.Orchestrator)
                 {
                     <span class="role-badge orchestrator" title="Orchestrator">🎯</span>
@@ -55,6 +65,10 @@
                 @if (Session.UnreadCount > 0)
                 {
                     <span class="unread-badge">@Session.UnreadCount</span>
+                }
+                @if (provider != null && Session.IsProcessing)
+                {
+                    <span class="processing-indicator" style="color: @provider.AccentColor;">●</span>
                 }
             }
         </span>
@@ -184,6 +198,12 @@
                         🔧 Fix with Copilot
                     </button>
                 }
+                @if (PlatformHelper.IsDesktop && !string.IsNullOrEmpty(Session.SessionId))
+                {
+                    <button class="menu-item" @onclick="async () => { await OnCloseMenu.InvokeAsync(); await OnAnalyze.InvokeAsync(); }">
+                        📊 Analyze Efficiency
+                    </button>
+                }
                 <div class="menu-separator"></div>
                 @if (PlatformHelper.IsDesktop && !string.IsNullOrEmpty(Session.SessionId))
                 {
@@ -194,7 +214,7 @@
                 @if (PlatformHelper.IsDesktop && !string.IsNullOrEmpty(sessionDir))
                 {
                     <button class="menu-item" @onclick="() => { OnCloseMenu.InvokeAsync(); OpenInVSCode(); }">
-                        ⌨ VS Code
+                        ⌨ @CopilotService.Editor.DisplayName()
                     </button>
                     <div class="menu-separator"></div>
                 }
@@ -228,6 +248,7 @@
     [Parameter] public EventCallback OnCloseMenu { get; set; }
     [Parameter] public EventCallback OnReportBug { get; set; }
     [Parameter] public EventCallback OnFixWithCopilot { get; set; }
+    [Parameter] public EventCallback OnAnalyze { get; set; }
 
     /// <summary>
     /// Show close confirmation via a JS-created dialog (outside Blazor's DOM tree).
@@ -264,6 +285,12 @@
     }
 
     private record CloseDialogResult(bool Confirmed, bool DeleteWorktree, bool DeleteBranch);
+
+    private async Task OpenContextMenu(MouseEventArgs e)
+    {
+        if (!IsMenuOpen)
+            await OnToggleMenu.InvokeAsync();
+    }
 
     private async Task HandleRenameKeyUp(KeyboardEventArgs e)
     {
@@ -374,6 +401,7 @@
         if (string.IsNullOrEmpty(dir)) return;
         try
         {
+            var cmd = CopilotService.Editor.Command();
             // In remote mode, use --folder-uri with vscode-remote:// to open via Remote - Tunnels
             var remoteFolderUri = PlatformHelper.BuildVSCodeRemoteFolderUri(
                 CopilotService.IsRemoteMode, CopilotService.ServerMachineName, dir);
@@ -387,7 +415,7 @@
                     CreateNoWindow = true
                 };
                 psi.ArgumentList.Add("/c");
-                psi.ArgumentList.Add("code");
+                psi.ArgumentList.Add(cmd);
                 if (remoteFolderUri != null)
                 {
                     psi.ArgumentList.Add("--folder-uri");
@@ -403,7 +431,7 @@
             {
                 var psi = new ProcessStartInfo
                 {
-                    FileName = "code",
+                    FileName = cmd,
                     UseShellExecute = false
                 };
                 if (remoteFolderUri != null)

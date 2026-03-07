@@ -209,6 +209,7 @@ public partial class CopilotService : IAsyncDisposable
     public ChatLayout ChatLayout { get; set; } = ChatLayout.Default;
     public ChatStyle ChatStyle { get; set; } = ChatStyle.Normal;
     public UiTheme Theme { get; set; } = UiTheme.System;
+    public VsCodeVariant Editor { get; set; } = VsCodeVariant.Stable;
 
     /// <summary>In-memory flag: user dismissed the holiday theme for this app session.</summary>
     public bool HolidayThemeDismissed { get; set; }
@@ -413,6 +414,7 @@ public partial class CopilotService : IAsyncDisposable
         ChatLayout = settings.ChatLayout;
         ChatStyle = settings.ChatStyle;
         Theme = settings.Theme;
+        Editor = settings.Editor;
 
         // On mobile with Remote mode and no URL configured, skip initialization
         if (settings.Mode == ConnectionMode.Remote && string.IsNullOrWhiteSpace(settings.RemoteUrl) && string.IsNullOrWhiteSpace(settings.LanUrl))
@@ -514,6 +516,9 @@ public partial class CopilotService : IAsyncDisposable
 
         // Resume any pending orchestration dispatch that was interrupted by a relaunch
         _ = ResumeOrchestrationIfPendingAsync(cancellationToken);
+
+        // Initialize any registered providers (from DI / plugin loader)
+        await InitializeProvidersAsync(cancellationToken);
     }
 
     /// <summary>
@@ -652,6 +657,9 @@ public partial class CopilotService : IAsyncDisposable
 
         // Resume any pending orchestration dispatch
         _ = ResumeOrchestrationIfPendingAsync(cancellationToken);
+
+        // Re-initialize providers after reconnect
+        await InitializeProvidersAsync(cancellationToken);
     }
 
     private CopilotClient CreateClient(ConnectionSettings settings)
@@ -1262,7 +1270,7 @@ public partial class CopilotService : IAsyncDisposable
         {
             Name = displayName,
             Model = resumeModel,
-            CreatedAt = DateTime.Now,
+            CreatedAt = DateTime.UtcNow,
             SessionId = sessionId,
             IsResumed = isStillProcessing,
             WorkingDirectory = resumeWorkingDirectory
@@ -1320,6 +1328,13 @@ public partial class CopilotService : IAsyncDisposable
             Session = copilotSession,
             Info = info
         };
+
+        // Cache multi-agent membership for the watchdog timeout tier.
+        // Must be set BEFORE StartProcessingWatchdog — otherwise the watchdog uses the
+        // 120s inactivity timeout instead of the 600s tool timeout, killing workers prematurely.
+        // IsSessionInMultiAgentGroup reads Organization.Sessions which was loaded from disk
+        // by LoadOrganization() before RestorePreviousSessionsAsync runs.
+        state.IsMultiAgentSession = IsSessionInMultiAgentGroup(displayName);
 
         // Wire up event handler BEFORE starting watchdog/timeout so events
         // arriving immediately after SDK resume are not missed.
@@ -1488,7 +1503,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         {
             Name = name,
             Model = sessionModel,
-            CreatedAt = DateTime.Now,
+            CreatedAt = DateTime.UtcNow,
             WorkingDirectory = sessionDir,
             GitBranch = GetGitBranch(sessionDir),
             IsCreating = true
@@ -1619,9 +1634,13 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         info.SessionId = copilotSession.SessionId;
         info.IsCreating = false;
 
-        // Session was closed while we were awaiting SDK creation -- dispose and bail
+        // Session was closed while we were awaiting SDK creation -- dispose and bail.
+        // Clean up any queued messages/images/modes so they don't leak to a future session with the same name.
         if (!_sessions.ContainsKey(name))
         {
+            state.Info.MessageQueue.Clear();
+            _queuedImagePaths.TryRemove(name, out _);
+            _queuedAgentModes.TryRemove(name, out _);
             try { await copilotSession.DisposeAsync(); } catch { }
             return info;
         }
@@ -1647,6 +1666,55 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         // Track session creation using display name as stable key
         // (SessionId may not be populated yet at creation time)
         _usageStats?.TrackSessionStart(name);
+
+        // Drain any messages queued while IsCreating was true.
+        // The user may have typed and sent a message before SDK creation finished.
+        if (state.Info.MessageQueue.Count > 0)
+        {
+            var nextPrompt = state.Info.MessageQueue[0];
+            state.Info.MessageQueue.RemoveAt(0);
+            List<string>? nextImagePaths = null;
+            lock (_imageQueueLock)
+            {
+                if (_queuedImagePaths.TryGetValue(name, out var imageQueue) && imageQueue.Count > 0)
+                {
+                    nextImagePaths = imageQueue[0];
+                    imageQueue.RemoveAt(0);
+                    if (imageQueue.Count == 0)
+                        _queuedImagePaths.TryRemove(name, out _);
+                }
+            }
+            string? nextAgentMode = null;
+            lock (_imageQueueLock)
+            {
+                if (_queuedAgentModes.TryGetValue(name, out var modeQueue) && modeQueue.Count > 0)
+                {
+                    nextAgentMode = modeQueue[0];
+                    modeQueue.RemoveAt(0);
+                    if (modeQueue.Count == 0)
+                        _queuedAgentModes.TryRemove(name, out _);
+                }
+            }
+            Debug($"[CREATE] Draining queued message for newly created session '{name}'");
+            _ = SendPromptAsync(name, nextPrompt, imagePaths: nextImagePaths, agentMode: nextAgentMode)
+                .ContinueWith(t =>
+                {
+                    if (t.IsFaulted)
+                    {
+                        var errorMsg = t.Exception?.InnerException?.Message ?? t.Exception?.Message ?? "unknown error";
+                        Debug($"[CREATE] Failed to send queued message for '{name}': {errorMsg}");
+                        InvokeOnUI(() =>
+                        {
+                            if (_sessions.TryGetValue(name, out var s))
+                            {
+                                s.Info.History.Add(ChatMessage.ErrorMessage($"Failed to send queued message: {errorMsg}"));
+                                s.Info.MessageCount = s.Info.History.Count;
+                                OnStateChanged?.Invoke();
+                            }
+                        });
+                    }
+                }, TaskContinuationOptions.OnlyOnFaulted);
+        }
         
         return info;
     }
@@ -1888,6 +1956,10 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
 
     public async Task<string> SendPromptAsync(string sessionName, string prompt, List<string>? imagePaths = null, CancellationToken cancellationToken = default, bool skipHistoryMessage = false, string? agentMode = null, string? originalPrompt = null)
     {
+        // Provider sessions route through their own messaging
+        if (IsProviderSession(sessionName))
+            return await SendToProviderAsync(sessionName, prompt, cancellationToken) ?? "";
+
         // Normalize smart punctuation (macOS/WebKit converts -- to em dash, etc.)
         prompt = SmartPunctuationNormalizer.Normalize(prompt);
 
@@ -1941,13 +2013,19 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         if (Interlocked.CompareExchange(ref state.SendingFlag, 1, 0) != 0)
             throw new InvalidOperationException("Session is already processing a request.");
 
+        long myGeneration = 0; // will be set right after the generation increment inside try
+
         try
         {
+        // Increment generation FIRST — before any other state mutation — so the catch block's
+        // generation guard always has a valid myGeneration to compare against. If this were later
+        // in the try block, an early exception would leave myGeneration=0, causing the guard
+        // (0 != actual_generation) to incorrectly skip the SendingFlag release → session deadlock.
+        myGeneration = Interlocked.Increment(ref state.ProcessingGeneration);
         state.Info.IsProcessing = true;
         state.Info.ProcessingStartedAt = DateTime.UtcNow;
         state.Info.ToolCallCount = 0;
         state.Info.ProcessingPhase = 0; // Sending
-        Interlocked.Increment(ref state.ProcessingGeneration);
         Interlocked.Exchange(ref state.ActiveToolCallCount, 0); // Reset stale tool count from previous turn
         state.HasUsedToolsThisTurn = false; // Reset stale tool flag from previous turn
         state.IsMultiAgentSession = IsSessionInMultiAgentGroup(sessionName); // Cache for watchdog (UI thread safe)
@@ -2107,12 +2185,13 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     // Start fresh watchdog for the new connection
                     StartProcessingWatchdog(state, sessionName);
                     
-                    Debug($"Session '{sessionName}' reconnected, retrying prompt...");
+                    Debug($"[RECONNECT] '{sessionName}' retrying prompt (len={prompt.Length})...");
                     var retryOptions = new MessageOptions
                     {
                         Prompt = prompt
                     };
                     await state.Session.SendAsync(retryOptions, cancellationToken);
+                    Debug($"[RECONNECT] '{sessionName}' SendAsync completed after reconnect — awaiting events");
                 }
                 catch (Exception retryEx)
                 {
@@ -2125,6 +2204,8 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     state.HasUsedToolsThisTurn = false;
                     state.Info.IsResumed = false;
                     state.Info.IsProcessing = false;
+                    if (state.Info.ProcessingStartedAt is { } rcStarted)
+                        state.Info.TotalApiTimeSeconds += (DateTime.UtcNow - rcStarted).TotalSeconds;
                     state.Info.ProcessingStartedAt = null;
                     state.Info.ToolCallCount = 0;
                     state.Info.ProcessingPhase = 0;
@@ -2142,6 +2223,8 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 state.HasUsedToolsThisTurn = false;
                 state.Info.IsResumed = false;
                 state.Info.IsProcessing = false;
+                if (state.Info.ProcessingStartedAt is { } saStarted)
+                    state.Info.TotalApiTimeSeconds += (DateTime.UtcNow - saStarted).TotalSeconds;
                 state.Info.ProcessingStartedAt = null;
                 state.Info.ToolCallCount = 0;
                 state.Info.ProcessingPhase = 0;
@@ -2158,14 +2241,21 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         }
         catch
         {
-            // Reset atomic send flag on any exception so the session isn't permanently locked
-            Interlocked.Exchange(ref state.SendingFlag, 0);
+            // Only release the send lock if we still own this generation.
+            // If a steer abort ran between our catch and here, it already reset
+            // SendingFlag=0 and incremented the generation for the new turn — we
+            // must not clobber that turn's lock.
+            if (Interlocked.Read(ref state.ProcessingGeneration) == myGeneration)
+                Interlocked.Exchange(ref state.SendingFlag, 0);
             throw;
         }
     }
 
-    public async Task AbortSessionAsync(string sessionName)
+    public async Task AbortSessionAsync(string sessionName, bool markAsInterrupted = false)
     {
+        // Provider sessions manage their own cancellation
+        if (IsProviderSession(sessionName)) return;
+
         // In remote mode, delegate to bridge server
         if (IsRemoteMode)
         {
@@ -2210,7 +2300,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         var partialResponse = state.CurrentResponse.ToString();
         if (!string.IsNullOrEmpty(partialResponse))
         {
-            var msg = new ChatMessage("assistant", partialResponse, DateTime.Now) { Model = state.Info.Model };
+            var msg = new ChatMessage("assistant", partialResponse, DateTime.Now) { Model = state.Info.Model, IsInterrupted = markAsInterrupted };
             state.Info.History.Add(msg);
             state.Info.MessageCount = state.Info.History.Count;
             if (!string.IsNullOrEmpty(state.Info.SessionId))
@@ -2221,11 +2311,15 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         Debug($"[ABORT] '{sessionName}' user abort, clearing IsProcessing");
         state.Info.IsProcessing = false;
         state.Info.IsResumed = false;
+        if (state.Info.ProcessingStartedAt is { } abortStarted)
+            state.Info.TotalApiTimeSeconds += (DateTime.UtcNow - abortStarted).TotalSeconds;
         state.Info.ProcessingStartedAt = null;
         state.Info.ToolCallCount = 0;
         state.Info.ProcessingPhase = 0;
         Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
         state.HasUsedToolsThisTurn = false;
+        // Release send lock — allows a subsequent SteerSessionAsync to acquire it immediately
+        Interlocked.Exchange(ref state.SendingFlag, 0);
         // Clear queued messages so they don't auto-send after abort
         state.Info.MessageQueue.Clear();
         _queuedImagePaths.TryRemove(sessionName, out _);
@@ -2235,6 +2329,116 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         state.PendingReasoningMessages.Clear();
         state.ResponseCompletion?.TrySetCanceled();
         OnStateChanged?.Invoke();
+    }
+
+    /// <summary>
+    /// Interrupts the current response (if any) and sends a new steering message.
+    /// If the session is not currently processing, sends normally.
+    ///
+    /// Uses two strategies depending on whether tools are active:
+    /// - Hard steer (plain streaming, no tools): aborts the current turn immediately,
+    ///   marks the partial response as interrupted, and starts a fresh turn.
+    /// - Soft steer (tools active/used): injects the steering message into the current
+    ///   turn via Mode="immediate" (SDK's ImmediatePromptProcessor), preserving the tool
+    ///   call context so the model can incorporate the redirection coherently.
+    /// </summary>
+    public async Task SteerSessionAsync(string sessionName, string steeringMessage, List<string>? imagePaths = null, string? agentMode = null)
+    {
+        if (!_sessions.TryGetValue(sessionName, out var state))
+        {
+            // Session not found — fall through to SendPromptAsync which will handle gracefully
+            await SendPromptAsync(sessionName, steeringMessage, imagePaths, agentMode: agentMode);
+            return;
+        }
+
+        bool toolsActiveOrUsed = Volatile.Read(ref state.ActiveToolCallCount) > 0 || Volatile.Read(ref state.HasUsedToolsThisTurn);
+
+        // Soft steer is only available for real SDK sessions (not demo/remote which lack CopilotSession).
+        if (state.Info.IsProcessing && toolsActiveOrUsed && !IsDemoMode && !IsRemoteMode && state.Session != null)
+        {
+            // Soft steer: inject into the current agentic turn via ImmediatePromptProcessor.
+            // The current tool call(s) finish cleanly; the steering message is prepended to
+            // the next LLM call within this turn, preserving full tool context.
+            Debug($"[STEER] '{sessionName}' soft steer (tools active/used), len={steeringMessage.Length}");
+
+            // Add user message to history so the steering input is visible in the UI and
+            // persisted — the same as the hard steer path does via SendPromptAsync.
+            var displayPrompt = steeringMessage;
+            if (imagePaths != null && imagePaths.Count > 0)
+                displayPrompt += "\n" + string.Join("\n", imagePaths);
+            var userMsg = new ChatMessage("user", displayPrompt, DateTime.Now);
+            state.Info.History.Add(userMsg);
+            state.Info.MessageCount = state.Info.History.Count;
+            state.Info.LastReadMessageCount = state.Info.History.Count;
+            // NOTE: chatDb write is deferred to after SendAsync succeeds so a connection error
+            // fallback doesn't leave an orphaned DB entry (which hard steer would then duplicate).
+            OnStateChanged?.Invoke();
+
+            var softSteerOptions = new MessageOptions { Prompt = steeringMessage, Mode = "immediate" };
+            if (imagePaths != null && imagePaths.Count > 0)
+                TryAttachImages(softSteerOptions, imagePaths);
+            bool softSteerSucceeded = false;
+            try
+            {
+                await state.Session.SendAsync(softSteerOptions);
+                softSteerSucceeded = true;
+                // Write to DB only after successful send to avoid orphaned entries on connection errors.
+                if (!string.IsNullOrEmpty(state.Info.SessionId))
+                    _ = _chatDb.AddMessageAsync(state.Info.SessionId, userMsg);
+            }
+            catch (Exception ex) when (IsConnectionError(ex))
+            {
+                // Connection lost (e.g., ObjectDisposedException on the JsonRpc transport).
+                // Remove the user message we already added to History — the hard steer path below
+                // will re-add it via SendPromptAsync which has full reconnection logic.
+                // No chatDb cleanup needed since the write was deferred above.
+                Debug($"[STEER-FALLBACK] '{sessionName}' soft steer hit connection error, falling through to hard steer (error={ex.Message})");
+                await InvokeOnUIAsync(() =>
+                {
+                    if (state.Info.History.Count > 0 && state.Info.History[^1] == userMsg)
+                    {
+                        state.Info.History.RemoveAt(state.Info.History.Count - 1);
+                        state.Info.MessageCount = state.Info.History.Count;
+                    }
+                });
+                // Fall through to hard steer below — do NOT return.
+            }
+            catch (Exception ex)
+            {
+                OnError?.Invoke(sessionName, $"Soft steer failed: {Models.ErrorMessageHelper.Humanize(ex)}");
+                CancelProcessingWatchdog(state);
+                FlushCurrentResponse(state);
+                Debug($"[STEER-ERROR] '{sessionName}' soft steer SendAsync failed, clearing IsProcessing (error={ex.Message})");
+                Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
+                state.HasUsedToolsThisTurn = false;
+                state.Info.IsResumed = false;
+                Interlocked.Exchange(ref state.SendingFlag, 0);
+                state.ResponseCompletion?.TrySetCanceled();
+                state.Info.IsProcessing = false;
+                if (state.Info.ProcessingStartedAt is { } steerStarted)
+                    state.Info.TotalApiTimeSeconds += (DateTime.UtcNow - steerStarted).TotalSeconds;
+                state.Info.ProcessingStartedAt = null;
+                state.Info.ToolCallCount = 0;
+                state.Info.ProcessingPhase = 0;
+                // Clear queued messages so stale entries don't auto-send on the next successful turn
+                state.Info.MessageQueue.Clear();
+                _queuedImagePaths.TryRemove(sessionName, out _);
+                _queuedAgentModes.TryRemove(sessionName, out _);
+                state.FlushedResponse.Clear();
+                state.PendingReasoningMessages.Clear();
+                OnStateChanged?.Invoke();
+                return;
+            }
+            if (softSteerSucceeded)
+                return;
+            // Connection error was caught above — fall through to hard steer.
+        }
+
+        // Hard steer: abort current streaming turn immediately, mark partial response as
+        // interrupted, then start a fresh turn with the steering message.
+        await AbortSessionAsync(sessionName, markAsInterrupted: true);
+        Debug($"[STEER] '{sessionName}' hard steer (no tools), len={steeringMessage.Length}");
+        await SendPromptAsync(sessionName, steeringMessage, imagePaths, agentMode: agentMode);
     }
 
     public void EnqueueMessage(string sessionName, string prompt, List<string>? imagePaths = null, string? agentMode = null)
@@ -2575,6 +2779,9 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
 
     internal async Task<bool> CloseSessionCoreAsync(string name, bool notifyUi)
     {
+        // Provider sessions manage their own lifecycle
+        if (IsProviderSession(name)) return false;
+
         // Clean up any active reflection cycle (including evaluator session)
         StopReflectionCycle(name);
 
@@ -2693,6 +2900,9 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         }
         _sessions.Clear();
 
+        // Shut down all registered providers
+        await ShutdownProvidersAsync();
+
         if (_client != null)
         {
             try { await _client.DisposeAsync(); } catch { }
@@ -2719,6 +2929,14 @@ public class ActiveSessionEntry
     public string Model { get; set; } = "";
     public string? WorkingDirectory { get; set; }
     public string? LastPrompt { get; set; }
+    // Usage stats persisted across reconnects
+    public int TotalInputTokens { get; set; }
+    public int TotalOutputTokens { get; set; }
+    public int? ContextCurrentTokens { get; set; }
+    public int? ContextTokenLimit { get; set; }
+    public int PremiumRequestsUsed { get; set; }
+    public double TotalApiTimeSeconds { get; set; }
+    public DateTime? CreatedAt { get; set; }
 }
 
 public class PersistedSessionInfo
