@@ -2,6 +2,7 @@
 @using PolyPilot.Models
 @using System.Diagnostics
 @inject CopilotService CopilotService
+@inject CodespaceService CodespaceService
 @inject RepoManager RepoManager
 @inject IJSRuntime JS
 
@@ -13,6 +14,8 @@
     var cssClass = IsActive ? "active" : 
                    IsCompleted ? "completed" :
                    Session.IsProcessing ? "busy" : "";
+    if (IsDisabled) cssClass += " cs-disconnected";
+    if (IsWorkerChild) cssClass += " worker-child";
     // Prefer SDK-reported context window; fall back to accumulated totals
     var hasContextWindow = Session.ContextCurrentTokens > 0 && Session.ContextTokenLimit > 0;
     var totalTokens = Session.TotalInputTokens + Session.TotalOutputTokens;
@@ -25,7 +28,7 @@
 <div class="session-item @cssClass @(isPinned ? "pinned" : "") @(provider != null ? "provider-session" : "")"
      data-session-name="@Session.Name"
      style="@(provider != null ? $"border-left: 3px solid {provider.AccentColor};" : "")"
-     @onclick="() => OnSelect.InvokeAsync()"
+     @onclick="async () => { if (!IsDisabled) await OnSelect.InvokeAsync(); }"
      @oncontextmenu="OpenContextMenu"
      @oncontextmenu:preventDefault="true">
     <div class="session-info">
@@ -79,6 +82,10 @@
                 {
                     <span class="model-override" title="Model override: @Meta.PreferredModel">⚡</span>
                 }
+                @if (Session.HasPermissionIssue)
+                {
+                    <span class="permission-warn-icon" title="Permission errors — reconnect needed">⚠️</span>
+                }
                 @if (Session.IsProcessing)
                 {
                     <span class="processing"> • @GetShortProcessingStatus()</span>
@@ -127,14 +134,20 @@
                         📌 Pin
                     </button>
                 }
-                @if (Groups != null && Groups.Count > 1)
+                @{
+                    var currentGroupForMove = Groups?.FirstOrDefault(g => g.Id == Meta?.GroupId);
+                    var isInCodespace = currentGroupForMove?.IsCodespace == true;
+                    // Codespace sessions are bound to their codespace — don't allow moving them.
+                    // Also exclude codespace groups as move targets for regular sessions.
+                    var moveTargets = Groups?.Where(g => g.Id != Meta?.GroupId && !g.IsCodespace).ToList();
+                }
+                @if (!isInCodespace && moveTargets != null && moveTargets.Count > 0)
                 {
                     <div class="menu-separator"></div>
                     <div class="menu-submenu">
                         <span class="menu-item submenu-label">📁 Move to…</span>
-                        @foreach (var g in Groups)
+                        @foreach (var g in moveTargets)
                         {
-                            if (g.Id == Meta?.GroupId) continue;
                             var targetId = g.Id;
                             <button class="menu-item submenu-item" @onclick="() => { OnCloseMenu.InvokeAsync(); OnMove.InvokeAsync(targetId); }">
                                 @g.Name
@@ -147,19 +160,6 @@
                 }
                 @if (currentGroup is { IsMultiAgent: true })
                 {
-                    <div class="menu-separator"></div>
-                    @if (Meta?.Role == MultiAgentRole.Orchestrator)
-                    {
-                        <button class="menu-item" @onclick="() => { OnCloseMenu.InvokeAsync(); CopilotService.SetSessionRole(Session.Name, MultiAgentRole.Worker); }">
-                            👷 Set as Worker
-                        </button>
-                    }
-                    else
-                    {
-                        <button class="menu-item" @onclick="() => { OnCloseMenu.InvokeAsync(); CopilotService.SetSessionRole(Session.Name, MultiAgentRole.Orchestrator); }">
-                            🎯 Set as Orchestrator
-                        </button>
-                    }
                     <div class="menu-separator"></div>
                     <span class="menu-item submenu-label">🧠 Model</span>
                     <div class="model-picker-inline" @onclick:stopPropagation="true">
@@ -205,16 +205,16 @@
                     </button>
                 }
                 <div class="menu-separator"></div>
-                @if (PlatformHelper.IsDesktop && !string.IsNullOrEmpty(Session.SessionId))
+                @if (PlatformHelper.IsDesktop && !string.IsNullOrEmpty(Session.SessionId) && currentGroup?.IsCodespace != true)
                 {
                     <button class="menu-item" @onclick="() => { OnCloseMenu.InvokeAsync(); OpenInCopilotConsole(); }">
                         >_ Copilot Console
                     </button>
                 }
-                @if (PlatformHelper.IsDesktop && !string.IsNullOrEmpty(sessionDir))
+                @if (PlatformHelper.IsDesktop && (!string.IsNullOrEmpty(sessionDir) || currentGroup?.IsCodespace == true))
                 {
                     <button class="menu-item" @onclick="() => { OnCloseMenu.InvokeAsync(); OpenInVSCode(); }">
-                        ⌨ @CopilotService.Editor.DisplayName()
+                        ⌨ @CopilotService.Editor.DisplayName()@(currentGroup?.IsCodespace == true ? " (Codespace)" : "")
                     </button>
                     <div class="menu-separator"></div>
                 }
@@ -231,11 +231,13 @@
     [Parameter] public SessionMeta? Meta { get; set; }
     [Parameter] public bool IsActive { get; set; }
     [Parameter] public bool IsCompleted { get; set; }
+    [Parameter] public bool IsDisabled { get; set; }
     [Parameter] public bool IsRenaming { get; set; }
     [Parameter] public bool IsMenuOpen { get; set; }
     [Parameter] public int ShortcutIndex { get; set; }
     [Parameter] public List<SessionGroup>? Groups { get; set; }
     [Parameter] public SessionUsageInfo? UsageInfo { get; set; }
+    [Parameter] public bool IsWorkerChild { get; set; }
 
     [Parameter] public EventCallback OnSelect { get; set; }
     [Parameter] public EventCallback OnClose { get; set; }
@@ -288,6 +290,7 @@
 
     private async Task OpenContextMenu(MouseEventArgs e)
     {
+        if (IsDisabled) return;
         if (!IsMenuOpen)
             await OnToggleMenu.InvokeAsync();
     }
@@ -315,7 +318,7 @@
     {
         if (Session.ProcessingPhase == 0) return "Sending…";
         if (Session.ProcessingPhase == 1) return "Connected…";
-        if (Session.ProcessingPhase == 2 && Session.ToolCallCount == 0) return "Thinking…";
+        if (Session.ProcessingPhase == 2 && Session.ToolCallCount == 0) return AppendShortLastActivity("Thinking…");
         var parts = new List<string>();
         if (Session.ProcessingStartedAt.HasValue)
         {
@@ -327,7 +330,21 @@
         }
         if (Session.ToolCallCount > 0)
             parts.Add($"{Session.ToolCallCount} tools");
-        return parts.Count > 0 ? string.Join(" · ", parts) : "Working";
+        var status = parts.Count > 0 ? string.Join(" · ", parts) : "Working";
+        return AppendShortLastActivity(status);
+    }
+
+    private string AppendShortLastActivity(string status)
+    {
+        var sinceActivity = DateTime.Now - Session.LastUpdatedAt;
+        if (sinceActivity.TotalSeconds >= 30)
+        {
+            var ago = sinceActivity.TotalMinutes >= 1
+                ? $"{(int)sinceActivity.TotalMinutes}m ago"
+                : $"{(int)sinceActivity.TotalSeconds}s ago";
+            return $"{status} · {ago}";
+        }
+        return status;
     }
 
     private string? GetSessionDirectory()
@@ -348,6 +365,12 @@
         var sessionId = Session.SessionId;
         if (string.IsNullOrEmpty(sessionId)) return;
         var dir = GetSessionDirectory() ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+
+        // Resolve the actual CLI binary path instead of assuming 'copilot' is on PATH
+        var settings = ConnectionSettings.Load();
+        var cliPath = CopilotService.ResolveCopilotCliPath(settings.CliSource);
+        if (string.IsNullOrEmpty(cliPath)) return;
+
         try
         {
             if (OperatingSystem.IsWindows())
@@ -356,13 +379,14 @@
                 var psDir = dir.Replace("'", "''");
                 var psName = Session.Name.Replace("'", "''");
                 var psId = sessionId.Replace("'", "''");
+                var psCli = cliPath.Replace("'", "''");
                 var psScript = Path.Combine(Path.GetTempPath(), $"polypilot-copilot-{Guid.NewGuid():N}.ps1");
                 File.WriteAllText(psScript,
                     $"Set-Location '{psDir}'\n" +
                     $"Write-Host '🔗 Resuming session: {psName} ({psId})'\n" +
                     "Write-Host '─────────────────────────────────────────'\n" +
                     "Write-Host ''\n" +
-                    $"copilot --resume '{psId}' --yolo\n");
+                    $"& '{psCli}' --resume '{psId}' --yolo\n");
                 Process.Start(new ProcessStartInfo("powershell.exe",
                     $"-ExecutionPolicy Bypass -NoExit -File \"{psScript}\"")
                 {
@@ -375,6 +399,7 @@
                 var safeDir = PlatformHelper.ShellEscape(dir);
                 var safeName = PlatformHelper.ShellEscape(Session.Name);
                 var safeId = PlatformHelper.ShellEscape(sessionId);
+                var safeCli = PlatformHelper.ShellEscape(cliPath);
 
                 var shellScript = Path.Combine(Path.GetTempPath(), $"polypilot-copilot-{Guid.NewGuid():N}.sh");
                 File.WriteAllText(shellScript,
@@ -383,7 +408,7 @@
                     $"echo '🔗 Resuming session:' {safeName} '('{safeId}')'\n" +
                     "echo '─────────────────────────────────────────'\n" +
                     "echo ''\n" +
-                    $"copilot --resume {safeId} --yolo\n");
+                    $"{safeCli} --resume {safeId} --yolo\n");
                 Process.Start("chmod", $"+x \"{shellScript}\"")?.WaitForExit();
                 Process.Start(new ProcessStartInfo("open", $"-a Terminal \"{shellScript}\"")
                 {
@@ -397,6 +422,32 @@
 
     private void OpenInVSCode()
     {
+        var currentGroup = Groups?.FirstOrDefault(g => g.Id == Meta?.GroupId);
+
+        // For codespace sessions, open VS Code directly in the codespace via gh cs code
+        if (currentGroup?.IsCodespace == true && !string.IsNullOrEmpty(currentGroup.CodespaceName))
+        {
+            try
+            {
+                var ghPath = CodespaceService.FindGhPath();
+                var psi = new ProcessStartInfo
+                {
+                    FileName = ghPath,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                psi.ArgumentList.Add("cs");
+                psi.ArgumentList.Add("code");
+                psi.ArgumentList.Add("-c");
+                psi.ArgumentList.Add(currentGroup.CodespaceName);
+                if (CopilotService.Editor == VsCodeVariant.Insiders)
+                    psi.ArgumentList.Add("--insiders");
+                Process.Start(psi);
+            }
+            catch (Exception ex) { Console.WriteLine($"Failed to open VS Code for codespace: {ex.Message}"); }
+            return;
+        }
+
         var dir = GetSessionDirectory();
         if (string.IsNullOrEmpty(dir)) return;
         try

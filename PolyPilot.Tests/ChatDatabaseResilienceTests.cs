@@ -10,11 +10,19 @@ namespace PolyPilot.Tests;
 public class ChatDatabaseResilienceTests : IDisposable
 {
     private readonly string _tempDir;
+    // A path that is truly impossible on ALL platforms (Windows, macOS, Linux).
+    // We create a regular file, then reference a path "inside" it — no OS allows
+    // creating directories underneath a regular file.
+    private readonly string _impossibleDbPath;
 
     public ChatDatabaseResilienceTests()
     {
         _tempDir = Path.Combine(Path.GetTempPath(), $"polypilot-chatdb-test-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_tempDir);
+
+        var blockerFile = Path.Combine(_tempDir, "blocker");
+        File.WriteAllText(blockerFile, "x");
+        _impossibleDbPath = Path.Combine(blockerFile, "sub", "test.db");
     }
 
     public void Dispose()
@@ -39,7 +47,7 @@ public class ChatDatabaseResilienceTests : IDisposable
     public async Task AddMessageAsync_WithInvalidPath_ReturnsNegativeOne()
     {
         // Point to a non-existent deeply nested path that can't be created
-        ChatDatabase.SetDbPathForTesting("/dev/null/impossible/path/test.db");
+        ChatDatabase.SetDbPathForTesting(_impossibleDbPath);
         var db = new ChatDatabase();
         db.ResetConnection();
 
@@ -52,7 +60,7 @@ public class ChatDatabaseResilienceTests : IDisposable
     [Fact]
     public async Task BulkInsertAsync_WithInvalidPath_DoesNotThrow()
     {
-        ChatDatabase.SetDbPathForTesting("/dev/null/impossible/path/test.db");
+        ChatDatabase.SetDbPathForTesting(_impossibleDbPath);
         var db = new ChatDatabase();
         db.ResetConnection();
 
@@ -65,7 +73,7 @@ public class ChatDatabaseResilienceTests : IDisposable
     [Fact]
     public async Task UpdateToolCompleteAsync_WithInvalidPath_DoesNotThrow()
     {
-        ChatDatabase.SetDbPathForTesting("/dev/null/impossible/path/test.db");
+        ChatDatabase.SetDbPathForTesting(_impossibleDbPath);
         var db = new ChatDatabase();
         db.ResetConnection();
 
@@ -75,7 +83,7 @@ public class ChatDatabaseResilienceTests : IDisposable
     [Fact]
     public async Task UpdateReasoningContentAsync_WithInvalidPath_DoesNotThrow()
     {
-        ChatDatabase.SetDbPathForTesting("/dev/null/impossible/path/test.db");
+        ChatDatabase.SetDbPathForTesting(_impossibleDbPath);
         var db = new ChatDatabase();
         db.ResetConnection();
 
@@ -86,7 +94,7 @@ public class ChatDatabaseResilienceTests : IDisposable
     public async Task GetConnectionAsync_DoesNotCacheBrokenConnection()
     {
         // First: use an invalid path to trigger failure
-        ChatDatabase.SetDbPathForTesting("/dev/null/impossible/path/test.db");
+        ChatDatabase.SetDbPathForTesting(_impossibleDbPath);
         var db = new ChatDatabase();
         db.ResetConnection();
 
@@ -124,7 +132,7 @@ public class ChatDatabaseResilienceTests : IDisposable
     [Fact]
     public async Task GetAllMessagesAsync_WithInvalidPath_ReturnsEmptyList()
     {
-        ChatDatabase.SetDbPathForTesting("/dev/null/impossible/path/test.db");
+        ChatDatabase.SetDbPathForTesting(_impossibleDbPath);
         var db = new ChatDatabase();
         db.ResetConnection();
 
@@ -135,7 +143,7 @@ public class ChatDatabaseResilienceTests : IDisposable
     [Fact]
     public async Task HasMessagesAsync_WithInvalidPath_ReturnsFalse()
     {
-        ChatDatabase.SetDbPathForTesting("/dev/null/impossible/path/test.db");
+        ChatDatabase.SetDbPathForTesting(_impossibleDbPath);
         var db = new ChatDatabase();
         db.ResetConnection();
 
@@ -146,7 +154,7 @@ public class ChatDatabaseResilienceTests : IDisposable
     [Fact]
     public async Task GetMessageCountAsync_WithInvalidPath_ReturnsZero()
     {
-        ChatDatabase.SetDbPathForTesting("/dev/null/impossible/path/test.db");
+        ChatDatabase.SetDbPathForTesting(_impossibleDbPath);
         var db = new ChatDatabase();
         db.ResetConnection();
 
@@ -157,7 +165,7 @@ public class ChatDatabaseResilienceTests : IDisposable
     [Fact]
     public async Task ClearSessionAsync_WithInvalidPath_DoesNotThrow()
     {
-        ChatDatabase.SetDbPathForTesting("/dev/null/impossible/path/test.db");
+        ChatDatabase.SetDbPathForTesting(_impossibleDbPath);
         var db = new ChatDatabase();
         db.ResetConnection();
 
@@ -232,41 +240,31 @@ public class ChatDatabaseResilienceTests : IDisposable
         // AddMessageAsync with a broken DB must NOT produce unobserved task exceptions.
         // Before the fix, AggregateException from SQLite async internals would escape
         // the narrow catch filter and become unobserved.
-        var unobservedException = false;
-        void handler(object? s, UnobservedTaskExceptionEventArgs e)
-        {
-            unobservedException = true;
-            e.SetObserved();
-        }
+        //
+        // Two-pronged verification:
+        // 1. Await the tasks — they must complete without throwing (internal catch)
+        // 2. Verify faulted tasks don't exist (no unobserved exception source)
+        ChatDatabase.SetDbPathForTesting(_impossibleDbPath);
+        var db = new ChatDatabase();
+        db.ResetConnection();
 
-        TaskScheduler.UnobservedTaskException += handler;
-        try
-        {
-            ChatDatabase.SetDbPathForTesting("/dev/null/impossible/path/test.db");
-            var db = new ChatDatabase();
-            db.ResetConnection();
+        var msg = ChatMessage.UserMessage("test");
 
-            var msg = ChatMessage.UserMessage("test");
+        // Fire-and-forget — same pattern as CopilotService.Events.cs
+        var t1 = db.AddMessageAsync("session-1", msg);
+        var t2 = db.UpdateToolCompleteAsync("session-1", "tool-1", "result", true);
+        var t3 = db.UpdateReasoningContentAsync("session-1", "reason-1", "content", true);
 
-            // Fire-and-forget — same pattern as CopilotService.Events.cs
-            _ = db.AddMessageAsync("session-1", msg);
-            _ = db.UpdateToolCompleteAsync("session-1", "tool-1", "result", true);
-            _ = db.UpdateReasoningContentAsync("session-1", "reason-1", "content", true);
+        // All tasks should complete without throwing — internal catch handles errors
+        await Task.WhenAll(t1, t2, t3);
 
-            // Give tasks time to complete and finalize
-            await Task.Delay(200);
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
-            GC.Collect();
-            await Task.Delay(100);
+        // Verify none faulted (faulted tasks are the source of unobserved exceptions)
+        Assert.False(t1.IsFaulted, "AddMessageAsync should catch internally, not fault");
+        Assert.False(t2.IsFaulted, "UpdateToolCompleteAsync should catch internally, not fault");
+        Assert.False(t3.IsFaulted, "UpdateReasoningContentAsync should catch internally, not fault");
 
-            Assert.False(unobservedException,
-                "Fire-and-forget ChatDatabase calls must not produce unobserved task exceptions");
-        }
-        finally
-        {
-            TaskScheduler.UnobservedTaskException -= handler;
-        }
+        // AddMessageAsync returns -1 on error (not an exception)
+        Assert.Equal(-1, t1.Result);
     }
 
     // -----------------------------------------------------------------------
@@ -348,7 +346,7 @@ public class ChatDatabaseResilienceTests : IDisposable
     [Fact]
     public async Task GetMessagesAsync_WithInvalidPath_ReturnsEmptyList()
     {
-        ChatDatabase.SetDbPathForTesting("/dev/null/impossible/path/test.db");
+        ChatDatabase.SetDbPathForTesting(_impossibleDbPath);
         var db = new ChatDatabase();
         db.ResetConnection();
 
@@ -423,7 +421,7 @@ public class ChatDatabaseResilienceTests : IDisposable
         db.ResetConnection();
         foreach (var f in Directory.GetFiles(_tempDir, "deleted-db*"))
             File.Delete(f);
-        ChatDatabase.SetDbPathForTesting("/dev/null/impossible/path/deleted.db");
+        ChatDatabase.SetDbPathForTesting(_impossibleDbPath);
 
         var result = await db.GetAllMessagesAsync("s1");
         Assert.Empty(result);

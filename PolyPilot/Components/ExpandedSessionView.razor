@@ -146,11 +146,14 @@
                          ProcessingStartedAt="Session.ProcessingStartedAt"
                          ToolCallCount="Session.ToolCallCount"
                          ProcessingPhase="Session.ProcessingPhase"
+                         LastActivityAt="Session.LastUpdatedAt"
                          Compact="false"
                          UserAvatarUrl="@UserAvatarUrl"
                          Layout="@Layout"
                          Style="@Style"
-                         RepoUrl="@RepoUrl" />
+                         RepoUrl="@RepoUrl"
+                         HasPermissionIssue="Session.HasPermissionIssue"
+                         OnReconnectRequested="OnReconnectRequested" />
     </div>
 
     @if (!string.IsNullOrEmpty(Error))
@@ -183,17 +186,20 @@
         {
             <div class="intent-pill">💭 @Intent</div>
         }
-        @if (Session.MessageQueue.Any())
+        @{
+            var queueSnapshot = Session.MessageQueue.Snapshot();
+        }
+        @if (queueSnapshot.Count > 0)
         {
             <div class="message-queue">
                 <div class="queue-header">
-                    <span>📋 Queued (@Session.MessageQueue.Count)</span>
+                    <span>📋 Queued (@queueSnapshot.Count)</span>
                     <button class="queue-clear-btn" @onclick="() => OnClearQueue.InvokeAsync(Session.Name)">Clear</button>
                 </div>
-                @for (var i = 0; i < Session.MessageQueue.Count; i++)
+                @for (var i = 0; i < queueSnapshot.Count; i++)
                 {
                     var index = i;
-                    var msg = Session.MessageQueue[i];
+                    var msg = queueSnapshot[i];
                     <div class="queue-item">
                         <span class="queue-index">@(index + 1)</span>
                         <span class="queue-text">@Truncate(msg, 80)</span>
@@ -248,7 +254,6 @@
                 <button class="mode-btn @(InputMode == "chat" ? "active" : "")" @onclick='() => OnSetInputMode.InvokeAsync("chat")' title="Chat mode — interactive conversation">Chat</button>
                 <button class="mode-btn @(InputMode == "plan" ? "active" : "")" @onclick='() => OnSetInputMode.InvokeAsync("plan")' title="Plan mode — create a plan before implementing">Plan</button>
                 <button class="mode-btn @(InputMode == "autopilot" ? "active" : "")" @onclick='() => OnSetInputMode.InvokeAsync("autopilot")' title="Autopilot mode — auto-approve tool calls">Autopilot</button>
-
             </div>
             @if (Session.ReflectionCycle is null || !Session.ReflectionCycle.IsActive)
             {
@@ -347,6 +352,7 @@
     [Parameter] public EventCallback<(string SessionName, FiestaStartRequest Request)> OnStartFiesta { get; set; }
     [Parameter] public EventCallback<string> OnStopFiesta { get; set; }
     [Parameter] public EventCallback OnStopReflection { get; set; }
+    [Parameter] public EventCallback OnReconnectRequested { get; set; }
 
     private bool _showFiestaPicker;
     private string _fiestaName = "";

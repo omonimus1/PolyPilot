@@ -122,9 +122,22 @@ public class InputValidationTests
         var imagesDir = ShowImageTool.GetImagesDir();
         Directory.CreateDirectory(imagesDir);
         var linkPath = Path.Combine(imagesDir, "evil-link.png");
+        // Use a fully-qualified absolute path outside the images dir so that
+        // ResolveLinkTarget returns a path clearly outside the boundary on all OSes.
+        // (Unix-style "/etc/passwd" lacks a drive letter on Windows and resolves
+        //  relative to the symlink's parent, defeating the containment check.)
+        var outsideTarget = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "nonexistent-target.png"));
         try
         {
-            File.CreateSymbolicLink(linkPath, "/etc/passwd");
+            File.CreateSymbolicLink(linkPath, outsideTarget);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Symlink creation requires elevated privileges on Windows — skip
+            return;
+        }
+        try
+        {
             Assert.Equal("Path not allowed", WsBridgeServer.ValidateImagePath(linkPath));
         }
         finally
@@ -139,10 +152,20 @@ public class InputValidationTests
         var imagesDir = ShowImageTool.GetImagesDir();
         Directory.CreateDirectory(imagesDir);
         var symlinkDir = Path.Combine(imagesDir, "evil-subdir");
+        // Use a fully-qualified absolute path so the symlink target resolves
+        // outside the images boundary on all platforms (see comment in sibling test).
+        var outsideDir = Path.GetFullPath(Path.GetTempPath());
         try
         {
-            // Create a directory symlink inside images/ pointing to /etc/
-            Directory.CreateSymbolicLink(symlinkDir, "/etc");
+            Directory.CreateSymbolicLink(symlinkDir, outsideDir);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Symlink creation requires elevated privileges on Windows — skip
+            return;
+        }
+        try
+        {
             var attackPath = Path.Combine(symlinkDir, "passwd");
             Assert.Equal("Path not allowed", WsBridgeServer.ValidateImagePath(attackPath));
         }

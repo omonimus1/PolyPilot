@@ -9,8 +9,8 @@
 
   <ItemGroup>
     <PackageReference Include="coverlet.collector" Version="8.0.0" />
-    <PackageReference Include="GitHub.Copilot.SDK" Version="0.1.26" />
-    <PackageReference Include="Markdig" Version="1.0.0" />
+    <PackageReference Include="GitHub.Copilot.SDK" Version="0.1.32" />
+    <PackageReference Include="Markdig" Version="1.1.1" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.3" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.3" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.3.0" />
@@ -28,6 +28,8 @@
   <ItemGroup>
     <Compile Include="../PolyPilot/Models/ChatMessage.cs" Link="Shared/ChatMessage.cs" />
     <Compile Include="../PolyPilot/Models/AgentSessionInfo.cs" Link="Shared/AgentSessionInfo.cs" />
+    <Compile Include="../PolyPilot/Models/SynchronizedMessageQueue.cs" Link="Shared/SynchronizedMessageQueue.cs" />
+    <Compile Include="../PolyPilot/Models/AuditLogEntry.cs" Link="Shared/AuditLogEntry.cs" />
     <Compile Include="../PolyPilot/Models/BridgeMessages.cs" Link="Shared/BridgeMessages.cs" />
     <Compile Include="../PolyPilot/Models/ConnectionSettings.cs" Link="Shared/ConnectionSettings.cs" />
     <Compile Include="../PolyPilot/Models/PlatformHelper.cs" Link="Shared/PlatformHelper.cs" />
@@ -57,7 +59,12 @@
     <Compile Include="../PolyPilot/Services/CopilotService.Bridge.cs" Link="Shared/CopilotService.Bridge.cs" />
     <Compile Include="../PolyPilot/Services/CopilotService.Organization.cs" Link="Shared/CopilotService.Organization.cs" />
     <Compile Include="../PolyPilot/Services/CopilotService.Persistence.cs" Link="Shared/CopilotService.Persistence.cs" />
+    <Compile Include="../PolyPilot/Services/CopilotService.Codespace.cs" Link="Shared/CopilotService.Codespace.cs" />
     <Compile Include="../PolyPilot/Services/CopilotService.Utilities.cs" Link="Shared/CopilotService.Utilities.cs" />
+    <Compile Include="../PolyPilot/Services/CodespaceService.cs" Link="Shared/CodespaceService.cs" />
+    <Compile Include="../PolyPilot/Services/CodespaceService.Diagnostics.cs" Link="Shared/CodespaceService.Diagnostics.cs" />
+    <Compile Include="../PolyPilot/Services/CodespaceService.Lifecycle.cs" Link="Shared/CodespaceService.Lifecycle.cs" />
+    <Compile Include="../PolyPilot/Services/AuditLogService.cs" Link="Shared/AuditLogService.cs" />
     <Compile Include="../PolyPilot/Services/ShowImageTool.cs" Link="Shared/ShowImageTool.cs" />
     <Compile Include="../PolyPilot/Services/WsBridgeServer.cs" Link="Shared/WsBridgeServer.cs" />
     <Compile Include="../PolyPilot/Services/WsBridgeClient.cs" Link="Shared/WsBridgeClient.cs" />
@@ -82,6 +89,7 @@
     <Compile Include="../PolyPilot/Services/MarkdownRenderer.cs" Link="Shared/MarkdownRenderer.cs" />
     <Compile Include="../PolyPilot/Services/CopilotService.Providers.cs" Link="Shared/CopilotService.Providers.cs" />
     <Compile Include="../PolyPilot/Services/PluginLoader.cs" Link="Shared/PluginLoader.cs" />
+    <Compile Include="../PolyPilot/Services/PluginFileLogger.cs" Link="Shared/PluginFileLogger.cs" />
     <Compile Include="../PolyPilot/Services/ProviderHostContext.cs" Link="Shared/ProviderHostContext.cs" />
     <Compile Include="../PolyPilot/Models/PluginSettings.cs" Link="Shared/PluginSettings.cs" />
   </ItemGroup>

@@ -82,10 +82,18 @@ public class ConnectionSettings
     public bool AutoUpdateFromMain { get; set; } = false;
     public CliSourceMode CliSource { get; set; } = CliSourceMode.BuiltIn;
     public VsCodeVariant Editor { get; set; } = VsCodeVariant.Stable;
+    public string? RepositoryStorageRoot { get; set; }
     public List<string> DisabledMcpServers { get; set; } = new();
     public List<string> DisabledPlugins { get; set; } = new();
     public PluginSettings Plugins { get; set; } = new();
     public bool EnableSessionNotifications { get; set; } = false;
+    public bool MuteWorkerNotifications { get; set; } = false;
+    public bool CodespacesEnabled { get; set; } = false;
+    /// <summary>
+    /// When true, logs every SDK event type to event-diagnostics.log (not just lifecycle events).
+    /// Useful for investigating zero-idle sessions (#299) — reveals the exact last event before silence.
+    /// </summary>
+    public bool EnableVerboseEventTracing { get; set; } = false;
 
     /// <summary>
     /// Normalizes a remote URL by ensuring it has an http(s):// scheme.
@@ -167,6 +175,7 @@ public class ConnectionSettings
         // Ensure loaded mode is valid for this platform
         if (!PlatformHelper.AvailableModes.Contains(settings.Mode))
             settings.Mode = PlatformHelper.DefaultMode;
+        settings.RepositoryStorageRoot = NormalizeRepositoryStorageRoot(settings.RepositoryStorageRoot);
 
         NormalizeEnumFields(settings);
 
@@ -175,6 +184,13 @@ public class ConnectionSettings
             settings.Theme = UiTheme.System;
 
         return settings;
+    }
+
+    public static string? NormalizeRepositoryStorageRoot(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return null;
+        return path.Trim();
     }
 
     /// <summary>Normalize invalid enum values to safe defaults. Testable separately from Load().</summary>

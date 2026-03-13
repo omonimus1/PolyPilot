@@ -41,9 +41,21 @@ public partial class CopilotService : IAsyncDisposable
     private readonly IServiceProvider? _serviceProvider;
     private readonly UsageStatsService? _usageStats;
     private CopilotClient? _client;
+    // Per-codespace-group clients keyed by SessionGroup.Id
+    private readonly ConcurrentDictionary<string, CopilotClient> _codespaceClients = new();
+    // Port-forward tunnel handles keyed by SessionGroup.Id — kept alive while group is active
+    private readonly ConcurrentDictionary<string, CodespaceService.TunnelHandle> _tunnelHandles = new();
+    // Codespace health-check background task
+    private CancellationTokenSource? _codespaceHealthCts;
+    private Task? _codespaceHealthTask;
+    // Cached dotfiles status — checked once when first SetupRequired state is encountered
+    private CodespaceService.DotfilesStatus? _dotfilesStatus;
     private ConnectionSettings? _currentSettings;
-    private string? _activeSessionName;
+    private volatile string? _activeSessionName;
     private SynchronizationContext? _syncContext;
+    // Serializes the IsConnectionError reconnect path so concurrent workers
+    // don't destroy each other's freshly-created client (thundering herd fix).
+    private readonly SemaphoreSlim _clientReconnectLock = new(1, 1);
     
     private static readonly object _pathLock = new();
     private static string? _copilotBaseDir;
@@ -136,6 +148,7 @@ public partial class CopilotService : IAsyncDisposable
             _copilotBaseDir = null;
             _sessionStatePath = null;
             _pendingOrchestrationFile = null;
+            _zeroIdleCaptureDir = null;
         }
     }
 
@@ -177,13 +190,14 @@ public partial class CopilotService : IAsyncDisposable
     public List<string> AvailableModels { get; private set; } = new();
 
     private readonly RepoManager _repoManager;
+    private readonly CodespaceService _codespaceService;
     
-    public CopilotService(IChatDatabase chatDb, IServerManager serverManager, IWsBridgeClient bridgeClient, RepoManager repoManager, IServiceProvider serviceProvider)
-    : this(chatDb, serverManager, bridgeClient, repoManager, serviceProvider, new DemoService())
+    public CopilotService(IChatDatabase chatDb, IServerManager serverManager, IWsBridgeClient bridgeClient, RepoManager repoManager, IServiceProvider serviceProvider, CodespaceService codespaceService)
+    : this(chatDb, serverManager, bridgeClient, repoManager, serviceProvider, new DemoService(), codespaceService)
     {
     }
 
-    internal CopilotService(IChatDatabase chatDb, IServerManager serverManager, IWsBridgeClient bridgeClient, RepoManager repoManager, IServiceProvider serviceProvider, IDemoService demoService)
+    internal CopilotService(IChatDatabase chatDb, IServerManager serverManager, IWsBridgeClient bridgeClient, RepoManager repoManager, IServiceProvider serviceProvider, IDemoService demoService, CodespaceService? codespaceService = null)
     {
         _chatDb = chatDb;
         _serverManager = serverManager;
@@ -191,6 +205,8 @@ public partial class CopilotService : IAsyncDisposable
         _repoManager = repoManager;
         _serviceProvider = serviceProvider;
         _demoService = demoService;
+        _codespaceService = codespaceService ?? new CodespaceService();
+        _stateChangedCoalesceTimer = new Timer(FireCoalescedStateChanged, null, Timeout.Infinite, Timeout.Infinite);
         try { _usageStats = serviceProvider?.GetService(typeof(UsageStatsService)) as UsageStatsService; } catch { }
     }
 
@@ -210,15 +226,144 @@ public partial class CopilotService : IAsyncDisposable
     public ChatStyle ChatStyle { get; set; } = ChatStyle.Normal;
     public UiTheme Theme { get; set; } = UiTheme.System;
     public VsCodeVariant Editor { get; set; } = VsCodeVariant.Stable;
+    private bool _codespacesEnabled;
+    public bool CodespacesEnabled
+    {
+        get => _codespacesEnabled;
+        set
+        {
+            if (_codespacesEnabled == value) return;
+            _codespacesEnabled = value;
+            if (value)
+            {
+                StartCodespaceHealthCheck();
+            }
+            else
+            {
+                // Stop health check first (awaits cancellation), then clean up resources.
+                // Sequential: health check must exit before we clear the dictionaries it reads.
+                _ = Task.Run(async () =>
+                {
+                    await StopCodespaceHealthCheckAsync();
+                    // Health check has exited — safe to dispose resources
+                    foreach (var kv in _codespaceClients)
+                        try { await kv.Value.DisposeAsync(); } catch { }
+                    _codespaceClients.Clear();
+                    foreach (var kv in _tunnelHandles)
+                        try { await kv.Value.DisposeAsync(); } catch { }
+                    _tunnelHandles.Clear();
+                });
+            }
+        }
+    }
 
     /// <summary>In-memory flag: user dismissed the holiday theme for this app session.</summary>
     public bool HolidayThemeDismissed { get; set; }
 
     // Session organization (groups, pinning, sorting)
+    // Organization.Sessions and Organization.Groups are plain List<T> — NOT thread-safe.
+    // ALL reads and writes to these lists MUST hold _organizationLock when accessed from
+    // background threads. UI-thread code should use the locked helpers below so that
+    // background snapshot readers never see a torn list. Off-thread reads MUST use
+    // SnapshotSessionMetas() / SnapshotGroups().
     public OrganizationState Organization { get; internal set; } = new();
+    private readonly object _organizationLock = new();
+
+    #region Organization lock: snapshot readers
+
+    /// <summary>
+    /// Returns a thread-safe snapshot of Organization.Sessions for use from
+    /// non-UI threads (timer callbacks, background tasks, health checks).
+    /// </summary>
+    internal List<SessionMeta> SnapshotSessionMetas()
+    {
+        lock (_organizationLock) return Organization.Sessions.ToList();
+    }
+
+    /// <summary>
+    /// Returns a thread-safe snapshot of Organization.Groups for use from
+    /// non-UI threads (health checks, background tasks).
+    /// </summary>
+    internal List<SessionGroup> SnapshotGroups()
+    {
+        lock (_organizationLock) return Organization.Groups.ToList();
+    }
+
+    #endregion
+
+    #region Organization lock: mutation helpers
+
+    /// <summary>Thread-safe: adds a SessionMeta to Organization.Sessions.</summary>
+    internal void AddSessionMeta(SessionMeta meta)
+    {
+        lock (_organizationLock) Organization.Sessions.Add(meta);
+    }
+
+    /// <summary>Thread-safe: removes all matching SessionMeta entries.</summary>
+    internal int RemoveSessionMetasWhere(Predicate<SessionMeta> match)
+    {
+        lock (_organizationLock) return Organization.Sessions.RemoveAll(match);
+    }
+
+    /// <summary>Thread-safe: removes a specific SessionMeta instance.</summary>
+    internal bool RemoveSessionMeta(SessionMeta meta)
+    {
+        lock (_organizationLock) return Organization.Sessions.Remove(meta);
+    }
+
+    /// <summary>Thread-safe: adds a SessionGroup to Organization.Groups.</summary>
+    internal void AddGroup(SessionGroup group)
+    {
+        lock (_organizationLock) Organization.Groups.Add(group);
+    }
+
+    /// <summary>Thread-safe: inserts a SessionGroup at the specified index.</summary>
+    internal void InsertGroup(int index, SessionGroup group)
+    {
+        lock (_organizationLock) Organization.Groups.Insert(index, group);
+    }
+
+    /// <summary>Thread-safe: removes all matching SessionGroup entries.</summary>
+    internal int RemoveGroupsWhere(Predicate<SessionGroup> match)
+    {
+        lock (_organizationLock) return Organization.Groups.RemoveAll(match);
+    }
+
+    #endregion
 
     public event Action? OnStateChanged;
     public void NotifyStateChanged() => OnStateChanged?.Invoke();
+
+    /// <summary>
+    /// Coalesced state change notification. Batches rapid-fire events (tool starts,
+    /// phase changes, turn starts) into a single OnStateChanged callback within the
+    /// coalesce window. Use this for high-frequency, non-critical state updates.
+    /// Critical events (completion, errors, session switches) should still call
+    /// OnStateChanged?.Invoke() directly for immediate UI response.
+    /// </summary>
+    private Timer? _stateChangedCoalesceTimer;
+    private const int StateChangedCoalesceMs = 150;
+    private int _stateChangedPending; // 0 = idle, 1 = pending
+
+    internal void NotifyStateChangedCoalesced()
+    {
+        // Mark as pending — if already pending, the timer will fire and pick it up
+        if (Interlocked.CompareExchange(ref _stateChangedPending, 1, 0) == 0)
+        {
+            try
+            {
+                _stateChangedCoalesceTimer?.Change(StateChangedCoalesceMs, Timeout.Infinite);
+            }
+            catch (ObjectDisposedException) { }
+        }
+    }
+
+    private void FireCoalescedStateChanged(object? _)
+    {
+        Interlocked.Exchange(ref _stateChangedPending, 0);
+        InvokeOnUI(() => OnStateChanged?.Invoke());
+    }
+
     public event Action<string, string>? OnContentReceived; // sessionName, content
     public event Action<string, string>? OnError; // sessionName, error
     public event Action<string, string>? OnSessionComplete; // sessionName, summary
@@ -251,13 +396,28 @@ public partial class CopilotService : IAsyncDisposable
         public bool SkipReflectionEvaluationOnce { get; set; }
         public long LastEventAtTicks = DateTime.UtcNow.Ticks;
         public CancellationTokenSource? ProcessingWatchdog { get; set; }
+        /// <summary>
+        /// CancellationTokenSource for the delayed CompleteResponse fallback started on AssistantTurnEndEvent.
+        /// Cancelled when SessionIdleEvent fires (normal completion), AssistantTurnStartEvent fires
+        /// (another tool round is starting), or a new SendPromptAsync call starts.
+        /// This handles the SDK bug where session.idle is never emitted after assistant.turn_end.
+        /// Must be a field (not property) so it can be used with Interlocked.Exchange.
+        /// </summary>
+        public CancellationTokenSource? TurnEndIdleCts;
         /// <summary>Number of tool calls started but not yet completed this turn.</summary>
         public int ActiveToolCallCount;
         /// <summary>True if any tool call has started during the current processing cycle.
         /// Unlike ActiveToolCallCount which resets on AssistantTurnStartEvent, this stays
         /// true until the response completes — so the watchdog uses the longer tool timeout
         /// even between tool rounds when the model is thinking.</summary>
-        public bool HasUsedToolsThisTurn;
+        public volatile bool HasUsedToolsThisTurn;
+        /// <summary>
+        /// Count of tools that completed successfully (no permission denial, no error) this turn.
+        /// Used to gate auto-resend on recovery: if tools already succeeded, resend is skipped
+        /// to avoid re-executing side-effectful work.
+        /// Reset on each new turn alongside HasUsedToolsThisTurn.
+        /// </summary>
+        public int SuccessfulToolCountThisTurn;
         /// <summary>True if this session belongs to a multi-agent group at the time the
         /// current prompt was sent. Cached at send time (UI thread) so the watchdog can
         /// read it safely from a background thread without accessing Organization lists.</summary>
@@ -281,6 +441,40 @@ public partial class CopilotService : IAsyncDisposable
         /// Cleared on CompleteResponse and SendPromptAsync.
         /// </summary>
         public ConcurrentDictionary<string, ChatMessage> PendingReasoningMessages { get; } = new();
+        /// <summary>Number of consecutive times the watchdog's Case A (tool active + server alive)
+        /// has reset the inactivity timer without any real SDK events arriving. Capped by
+        /// WatchdogMaxToolAliveResets to prevent infinite resets when the session's JSON-RPC
+        /// connection is dead but the shared persistent server is still alive.</summary>
+        public int WatchdogCaseAResets;
+        /// <summary>Number of consecutive times Case B (tool finished, events.jsonl still fresh)
+        /// deferred completion. Capped by WatchdogMaxCaseBResets to prevent infinite deferrals
+        /// when events.jsonl was written during the turn but the CLI has actually finished.</summary>
+        public int WatchdogCaseBResets;
+        /// <summary>True if the TurnEnd→Idle fallback was canceled by an AssistantTurnStartEvent.
+        /// Used for diagnostic logging: when the next TurnEnd re-arms the fallback, the log shows
+        /// the self-healing loop in action (TurnEnd → TurnStart cancel → TurnEnd re-arm).</summary>
+        public volatile bool FallbackCanceledByTurnStart;
+        /// <summary>When true, FlushCurrentResponse checks accumulated FlushedResponse for
+        /// @worker:...@end blocks after each sub-turn. If found, resolves ResponseCompletion
+        /// early so orchestrator dispatch can proceed without waiting for the model to finish
+        /// all its tool rounds. This prevents the orchestrator from doing all the work itself
+        /// when it has tool access and ignores "dispatcher only" instructions.</summary>
+        public bool EarlyDispatchOnWorkerBlocks;
+        /// <summary>Timer that fires shortly after a tool starts to verify the connection is still alive.
+        /// If no tool completion event arrives within ToolHealthCheckIntervalMs, we do an active health
+        /// check to detect dead connections early (instead of waiting for the 600s watchdog timeout).</summary>
+        public Timer? ToolHealthCheckTimer;
+        public int ToolHealthStaleChecks; // Separate from WatchdogCaseAResets — health check's own stale counter
+        /// <summary>Timestamp when the most recent tool started. Used by the tool health check to
+        /// determine if a tool has been running too long without any events.</summary>
+        public long ToolStartedAtTicks;
+        /// <summary>Count of SDK events received during the current processing turn.
+        /// Incremented in HandleSessionEvent, reset in SendPromptAsync and CompleteResponse.
+        /// Used by zero-idle capture to quantify how much activity occurred before silence.</summary>
+        public int EventCountThisTurn;
+        /// <summary>Timestamp (UTC ticks) when AssistantTurnEndEvent was received.
+        /// Used by zero-idle capture to measure fallback wait duration.</summary>
+        public long TurnEndReceivedAtTicks;
     }
 
     private void Debug(string message)
@@ -295,6 +489,8 @@ public partial class CopilotService : IAsyncDisposable
             message.StartsWith("[COMPLETE") || message.StartsWith("[SEND") ||
             message.StartsWith("[RECONNECT") || message.StartsWith("[UI-ERR") ||
             message.StartsWith("[DISPATCH") || message.StartsWith("[WATCHDOG") ||
+            message.StartsWith("[HEALTH") || message.StartsWith("[ZERO-IDLE") ||
+            message.StartsWith("[PERMISSION") ||
             message.Contains("watchdog"))
         {
             try
@@ -415,6 +611,9 @@ public partial class CopilotService : IAsyncDisposable
         ChatStyle = settings.ChatStyle;
         Theme = settings.Theme;
         Editor = settings.Editor;
+        // Codespaces only supported in Embedded mode — tunnels die with the app,
+        // matching Embedded's lifecycle. Prevent confusion in Persistent/Remote mode.
+        CodespacesEnabled = settings.CodespacesEnabled && settings.Mode == ConnectionMode.Embedded;
 
         // On mobile with Remote mode and no URL configured, skip initialization
         if (settings.Mode == ConnectionMode.Remote && string.IsNullOrWhiteSpace(settings.RemoteUrl) && string.IsNullOrWhiteSpace(settings.LanUrl))
@@ -480,6 +679,79 @@ public partial class CopilotService : IAsyncDisposable
             Debug($"Copilot client started in {settings.Mode} mode");
         }
         catch (OperationCanceledException) { throw; }
+        catch (Exception ex) when (settings.Mode == ConnectionMode.Persistent
+            && ex.Message.Contains("version mismatch", StringComparison.OrdinalIgnoreCase))
+        {
+            // The persistent server is running an older/newer protocol version than the SDK.
+            // Kill it, restart with the current CLI, and retry once.
+            Debug($"Protocol version mismatch with persistent server — restarting: {ex.Message}");
+            try { await _client.DisposeAsync(); } catch { }
+            _client = null;
+
+            _serverManager.StopServer();
+
+            // Wait for the old server to fully release the port (Kill is async)
+            for (int i = 0; i < 20; i++)
+            {
+                if (!_serverManager.CheckServerRunning("127.0.0.1", settings.Port))
+                    break;
+                await Task.Delay(250, cancellationToken);
+            }
+
+            var restarted = await _serverManager.StartServerAsync(settings.Port);
+            if (restarted)
+            {
+                Debug("Server restarted, retrying connection...");
+                _client = CreateClient(settings);
+                try
+                {
+                    await _client.StartAsync(cancellationToken);
+                    IsInitialized = true;
+                    NeedsConfiguration = false;
+                    Debug($"Copilot client started after server restart in {settings.Mode} mode");
+                    OnStateChanged?.Invoke();
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception retryEx)
+                {
+                    Debug($"Failed to start Copilot client after server restart: {retryEx.Message}");
+                    try { await _client.DisposeAsync(); } catch { }
+                    _client = null;
+                    IsInitialized = false;
+                    NeedsConfiguration = true;
+                    FallbackNotice = $"Protocol version mismatch and restart failed — go to Settings to reconnect.";
+                    OnStateChanged?.Invoke();
+                    return;
+                }
+            }
+            else
+            {
+                Debug("Server restart failed, falling back to Embedded mode");
+                CurrentMode = ConnectionMode.Embedded;
+                FallbackNotice = "Persistent server had a version mismatch and couldn't restart — fell back to Embedded mode.";
+                var embeddedSettings = new ConnectionSettings { Mode = ConnectionMode.Embedded, Host = settings.Host, Port = settings.Port };
+                _client = CreateClient(embeddedSettings);
+                try
+                {
+                    await _client.StartAsync(cancellationToken);
+                    IsInitialized = true;
+                    NeedsConfiguration = false;
+                    Debug($"Copilot client started in Embedded fallback mode");
+                    OnStateChanged?.Invoke();
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception fallbackEx)
+                {
+                    Debug($"Embedded fallback also failed: {fallbackEx.Message}");
+                    try { await _client.DisposeAsync(); } catch { }
+                    _client = null;
+                    IsInitialized = false;
+                    NeedsConfiguration = true;
+                    OnStateChanged?.Invoke();
+                    return;
+                }
+            }
+        }
         catch (Exception ex)
         {
             Debug($"Failed to start Copilot client: {ex.Message}");
@@ -509,6 +781,10 @@ public partial class CopilotService : IAsyncDisposable
         OnStateChanged?.Invoke();
         await RestorePreviousSessionsAsync(cancellationToken);
         IsRestoring = false;
+
+        // Start health check loop for any codespace groups (regardless of whether sessions were restored)
+        if (CodespacesEnabled)
+            StartCodespaceHealthCheck();
 
         // Reconcile now that all sessions are restored
         ReconcileOrganization();
@@ -582,11 +858,14 @@ public partial class CopilotService : IAsyncDisposable
         _currentSettings = settings;
 
         StopConnectivityMonitoring();
+        await StopCodespaceHealthCheckAsync();
 
         // Dispose existing sessions and client
         foreach (var state in _sessions.Values)
         {
             CancelProcessingWatchdog(state);
+            CancelTurnEndFallback(state);
+            CancelToolHealthCheck(state);
             try { if (state.Session != null) await state.Session.DisposeAsync(); } catch { }
         }
         _sessions.Clear();
@@ -604,6 +883,16 @@ public partial class CopilotService : IAsyncDisposable
             try { await _client.DisposeAsync(); } catch { }
             _client = null;
         }
+        foreach (var kv in _codespaceClients)
+        {
+            try { await kv.Value.DisposeAsync(); } catch { }
+        }
+        _codespaceClients.Clear();
+        foreach (var kv in _tunnelHandles)
+        {
+            try { await kv.Value.DisposeAsync(); } catch { }
+        }
+        _tunnelHandles.Clear();
         _bridgeClient.Stop();
 
         IsInitialized = false;
@@ -611,6 +900,7 @@ public partial class CopilotService : IAsyncDisposable
         IsDemoMode = false;
         FallbackNotice = null; // Clear any previous fallback notice
         CurrentMode = settings.Mode;
+        CodespacesEnabled = settings.CodespacesEnabled && settings.Mode == ConnectionMode.Embedded;
         OnStateChanged?.Invoke();
 
         // Demo mode: local mock responses
@@ -652,6 +942,8 @@ public partial class CopilotService : IAsyncDisposable
         // Restore previous sessions
         LoadOrganization();
         await RestorePreviousSessionsAsync(cancellationToken);
+        if (CodespacesEnabled)
+            StartCodespaceHealthCheck();
         ReconcileOrganization();
         OnStateChanged?.Invoke();
 
@@ -696,12 +988,13 @@ public partial class CopilotService : IAsyncDisposable
         return new CopilotClient(options);
     }
 
+
     /// <summary>
     /// Resolves the copilot CLI path based on user preference.
     /// BuiltIn: bundled binary first, then system fallback.
     /// System: system-installed binary first, then bundled fallback.
     /// </summary>
-    private static string? ResolveCopilotCliPath(CliSourceMode source = CliSourceMode.BuiltIn)
+    internal static string? ResolveCopilotCliPath(CliSourceMode source = CliSourceMode.BuiltIn)
     {
         if (source == CliSourceMode.System)
         {
@@ -1209,7 +1502,7 @@ public partial class CopilotService : IAsyncDisposable
     /// <summary>
     /// Resume an existing session by its GUID
     /// </summary>
-    public async Task<AgentSessionInfo> ResumeSessionAsync(string sessionId, string displayName, string? workingDirectory = null, string? model = null, CancellationToken cancellationToken = default, string? lastPrompt = null)
+    public async Task<AgentSessionInfo> ResumeSessionAsync(string sessionId, string displayName, string? workingDirectory = null, string? model = null, CancellationToken cancellationToken = default, string? lastPrompt = null, string? groupId = null)
     {
         // In remote mode, delegate to WsBridgeClient
         if (IsRemoteMode)
@@ -1226,13 +1519,25 @@ public partial class CopilotService : IAsyncDisposable
             _pendingRemoteSessions[displayName] = 0;
             _sessions[displayName] = new SessionState { Session = null!, Info = remoteInfo };
             if (!Organization.Sessions.Any(m => m.SessionName == displayName))
-                Organization.Sessions.Add(new SessionMeta { SessionName = displayName, GroupId = SessionGroup.DefaultId });
+                AddSessionMeta(new SessionMeta { SessionName = displayName, GroupId = SessionGroup.DefaultId });
             _activeSessionName = displayName;
             OnStateChanged?.Invoke();
             // Now send the bridge message — server may respond before this returns
             await _bridgeClient.ResumeSessionAsync(sessionId, displayName, cancellationToken);
             _ = Task.Delay(30_000).ContinueWith(t => { _pendingRemoteSessions.TryRemove(displayName, out _); });
             return remoteInfo;
+        }
+
+        // For codespace sessions, verify the group is connected before attempting resume.
+        // This MUST come before the _client == null guard below, because codespace sessions
+        // use _codespaceClients (not _client). Without this check, the "Service not initialized"
+        // error fires and maps to the misleading "Copilot is not connected yet" user-facing message.
+        if (groupId != null)
+        {
+            var group = Organization.Groups.FirstOrDefault(g => g.Id == groupId);
+            if (group?.IsCodespace == true && !_codespaceClients.ContainsKey(groupId))
+                throw new InvalidOperationException(
+                    $"Codespace '{group.Name}' is not connected yet. The health check will reconnect automatically. Please retry in a moment.");
         }
 
         if (!IsInitialized || _client == null)
@@ -1244,8 +1549,23 @@ public partial class CopilotService : IAsyncDisposable
         if (!Guid.TryParse(sessionId, out _))
             throw new ArgumentException("Session ID must be a valid GUID.", nameof(sessionId));
 
+        // De-duplicate display name if already taken (persisted sessions may share
+        // the same title derived from their first message)
         if (_sessions.ContainsKey(displayName))
-            throw new InvalidOperationException($"Session '{displayName}' already exists.");
+        {
+            var baseName = displayName;
+            for (int i = 2; i <= 99; i++)
+            {
+                var candidate = $"{baseName} ({i})";
+                if (!_sessions.ContainsKey(candidate))
+                {
+                    displayName = candidate;
+                    break;
+                }
+            }
+            if (_sessions.ContainsKey(displayName))
+                throw new InvalidOperationException($"Session '{baseName}' already exists (too many duplicates).");
+        }
 
         // Load history: always parse events.jsonl as source of truth, then sync to DB
         List<ChatMessage> history = LoadHistoryFromDisk(sessionId);
@@ -1257,12 +1577,22 @@ public partial class CopilotService : IAsyncDisposable
         }
 
         var resumeWorkingDirectory = workingDirectory ?? GetSessionWorkingDirectory(sessionId);
+
+        // Override for codespace sessions — the local worktree path doesn't exist inside
+        // the codespace; use /workspaces/{repo} instead.
+        if (groupId != null)
+        {
+            var csGroup = Organization.Groups.FirstOrDefault(g => g.Id == groupId);
+            if (csGroup?.IsCodespace == true && csGroup.CodespaceWorkingDirectory != null)
+                resumeWorkingDirectory = csGroup.CodespaceWorkingDirectory;
+        }
+
         // Resume the session using the SDK — pass model and working directory so backend context is preserved
         var resumeModel = Models.ModelHelper.NormalizeToSlug(model ?? GetSessionModelFromDisk(sessionId) ?? DefaultModel);
         if (string.IsNullOrEmpty(resumeModel)) resumeModel = DefaultModel;
         Debug($"Resuming session '{displayName}' with model: '{resumeModel}', cwd: '{resumeWorkingDirectory}'");
         var resumeConfig = new ResumeSessionConfig { Model = resumeModel, WorkingDirectory = resumeWorkingDirectory, Tools = new List<Microsoft.Extensions.AI.AIFunction> { ShowImageTool.CreateFunction() }, OnPermissionRequest = AutoApprovePermissions };
-        var copilotSession = await _client.ResumeSessionAsync(sessionId, resumeConfig, cancellationToken);
+        var copilotSession = await GetClientForGroup(groupId).ResumeSessionAsync(sessionId, resumeConfig, cancellationToken);
 
         var isStillProcessing = IsSessionStillProcessing(sessionId);
 
@@ -1357,7 +1687,7 @@ public partial class CopilotService : IAsyncDisposable
             {
                 Volatile.Write(ref state.HasReceivedEventsSinceResume, true);
                 if (hadToolActivity)
-                    Volatile.Write(ref state.HasUsedToolsThisTurn, true);
+                    state.HasUsedToolsThisTurn = true;
                 Debug($"[RESTORE] '{displayName}' events.jsonl is fresh — bypassing quiescence " +
                       $"(hadToolActivity={hadToolActivity})");
             }
@@ -1389,9 +1719,9 @@ public partial class CopilotService : IAsyncDisposable
     /// <summary>Auto-approve all tool permission requests. Without this, worker sessions
     /// (which have no interactive user) get "Permission denied" on every tool call.</summary>
     private static Task<PermissionRequestResult> AutoApprovePermissions(PermissionRequest request, PermissionInvocation invocation)
-        => Task.FromResult(new PermissionRequestResult { Kind = "approved" });
+        => Task.FromResult(new PermissionRequestResult { Kind = PermissionRequestResultKind.Approved });
 
-    public async Task<AgentSessionInfo> CreateSessionAsync(string name, string? model = null, string? workingDirectory = null, CancellationToken cancellationToken = default)
+    public async Task<AgentSessionInfo> CreateSessionAsync(string name, string? model = null, string? workingDirectory = null, CancellationToken cancellationToken = default, string? groupId = null)
     {
         // In demo mode, create a local mock session
         if (IsDemoMode)
@@ -1403,7 +1733,7 @@ public partial class CopilotService : IAsyncDisposable
             _sessions[name] = demoState;
             _activeSessionName ??= name;
             if (!Organization.Sessions.Any(m => m.SessionName == name))
-                Organization.Sessions.Add(new SessionMeta { SessionName = name, GroupId = SessionGroup.DefaultId });
+                AddSessionMeta(new SessionMeta { SessionName = name, GroupId = SessionGroup.DefaultId });
             OnStateChanged?.Invoke();
             return demoInfo;
         }
@@ -1419,12 +1749,24 @@ public partial class CopilotService : IAsyncDisposable
             if (existingMeta != null)
                 existingMeta.IsPinned = false;
             else
-                Organization.Sessions.Add(new SessionMeta { SessionName = name, GroupId = SessionGroup.DefaultId });
+                AddSessionMeta(new SessionMeta { SessionName = name, GroupId = SessionGroup.DefaultId });
             _activeSessionName = name;
             OnStateChanged?.Invoke();
             await _bridgeClient.CreateSessionAsync(name, model, workingDirectory, cancellationToken);
             _ = Task.Delay(30_000).ContinueWith(t => { _pendingRemoteSessions.TryRemove(name, out _); });
             return remoteInfo;
+        }
+
+        // For codespace sessions, verify the group is connected before attempting create.
+        // This MUST come before the _client == null guard below, because codespace sessions
+        // use _codespaceClients (not _client). Without this, the "Service not initialized"
+        // error fires and maps to the misleading "Copilot is not connected yet" message.
+        if (groupId != null)
+        {
+            var group = Organization.Groups.FirstOrDefault(g => g.Id == groupId);
+            if (group?.IsCodespace == true && !_codespaceClients.ContainsKey(groupId))
+                throw new InvalidOperationException(
+                    $"Codespace '{group.Name}' is not connected yet. The health check will reconnect automatically. Please retry in a moment.");
         }
 
         if (!IsInitialized || _client == null)
@@ -1448,6 +1790,15 @@ public partial class CopilotService : IAsyncDisposable
         else
         {
             sessionDir = string.IsNullOrWhiteSpace(workingDirectory) ? ProjectDir : workingDirectory;
+        }
+
+        // Override for codespace sessions — the local worktree path doesn't exist inside
+        // the codespace; use /workspaces/{repo} instead.
+        if (groupId != null)
+        {
+            var csGroup = Organization.Groups.FirstOrDefault(g => g.Id == groupId);
+            if (csGroup?.IsCodespace == true && csGroup.CodespaceWorkingDirectory != null)
+                sessionDir = csGroup.CodespaceWorkingDirectory;
         }
 
         // Build system message with critical relaunch instructions
@@ -1519,18 +1870,18 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         _sessions[name] = state;
         _activeSessionName = name;
         if (!Organization.Sessions.Any(m => m.SessionName == name))
-            Organization.Sessions.Add(new SessionMeta { SessionName = name, GroupId = SessionGroup.DefaultId });
+            AddSessionMeta(new SessionMeta { SessionName = name, GroupId = groupId ?? SessionGroup.DefaultId });
         OnStateChanged?.Invoke();
 
         CopilotSession copilotSession;
         try
         {
-            copilotSession = await _client.CreateSessionAsync(config, cancellationToken);
+            copilotSession = await GetClientForGroup(groupId).CreateSessionAsync(config, cancellationToken);
         }
         catch (OperationCanceledException)
         {
             _sessions.TryRemove(name, out _);
-            Organization.Sessions.RemoveAll(m => m.SessionName == name);
+            RemoveSessionMetasWhere(m => m.SessionName == name);
             _activeSessionName = previousActiveSessionName;
             OnStateChanged?.Invoke();
             throw;
@@ -1538,6 +1889,20 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         catch (Exception ex) when (IsConnectionError(ex))
         {
             Debug($"CreateSessionAsync connection error, attempting recovery: {ex.Message}");
+
+            // Don't nuke the main client for codespace session failures —
+            // the codespace health check handles reconnection automatically.
+            var isCodespaceSession = groupId != null &&
+                Organization.Groups.Any(g => g.Id == groupId && g.IsCodespace);
+            if (isCodespaceSession)
+            {
+                _sessions.TryRemove(name, out _);
+                RemoveSessionMetasWhere(m => m.SessionName == name);
+                _activeSessionName = previousActiveSessionName;
+                OnStateChanged?.Invoke();
+                throw new InvalidOperationException(
+                    "Codespace connection lost. The health check will reconnect automatically. Please retry in a moment.");
+            }
 
             // In persistent mode, restart the server if it's not running
             if (CurrentMode == ConnectionMode.Persistent)
@@ -1553,7 +1918,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                         _client = null;
                         IsInitialized = false;
                         _sessions.TryRemove(name, out _);
-                        Organization.Sessions.RemoveAll(m => m.SessionName == name);
+                        RemoveSessionMetasWhere(m => m.SessionName == name);
                         _activeSessionName = previousActiveSessionName;
                         OnStateChanged?.Invoke();
                         throw;
@@ -1578,7 +1943,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 _client = null;
                 IsInitialized = false;
                 _sessions.TryRemove(name, out _);
-                Organization.Sessions.RemoveAll(m => m.SessionName == name);
+                RemoveSessionMetasWhere(m => m.SessionName == name);
                 _activeSessionName = previousActiveSessionName;
                 OnStateChanged?.Invoke();
                 throw;
@@ -1590,7 +1955,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 _client = null;
                 IsInitialized = false;
                 _sessions.TryRemove(name, out _);
-                Organization.Sessions.RemoveAll(m => m.SessionName == name);
+                RemoveSessionMetasWhere(m => m.SessionName == name);
                 _activeSessionName = previousActiveSessionName;
                 OnStateChanged?.Invoke();
                 throw;
@@ -1604,7 +1969,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             catch (OperationCanceledException)
             {
                 _sessions.TryRemove(name, out _);
-                Organization.Sessions.RemoveAll(m => m.SessionName == name);
+                RemoveSessionMetasWhere(m => m.SessionName == name);
                 _activeSessionName = previousActiveSessionName;
                 OnStateChanged?.Invoke();
                 throw;
@@ -1615,7 +1980,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 _client = null;
                 IsInitialized = false;
                 _sessions.TryRemove(name, out _);
-                Organization.Sessions.RemoveAll(m => m.SessionName == name);
+                RemoveSessionMetasWhere(m => m.SessionName == name);
                 _activeSessionName = previousActiveSessionName;
                 OnStateChanged?.Invoke();
                 throw;
@@ -1625,7 +1990,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         {
             // SDK creation failed — remove the optimistic placeholder and restore prior state
             _sessions.TryRemove(name, out _);
-            Organization.Sessions.RemoveAll(m => m.SessionName == name);
+            RemoveSessionMetasWhere(m => m.SessionName == name);
             _activeSessionName = previousActiveSessionName;
             OnStateChanged?.Invoke();
             throw;
@@ -1657,7 +2022,16 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         // Reset stale pin from a previous session with the same name
         var staleMeta = Organization.Sessions.FirstOrDefault(m => m.SessionName == name);
         if (staleMeta != null)
+        {
             staleMeta.IsPinned = false;
+            if (!string.IsNullOrEmpty(groupId))
+                staleMeta.GroupId = groupId;
+        }
+        else if (!string.IsNullOrEmpty(groupId))
+        {
+            // Pre-create meta with the correct group so ReconcileOrganization places it there
+            AddSessionMeta(new SessionMeta { SessionName = name, GroupId = groupId });
+        }
 
         SaveActiveSessionsToDisk();
         ReconcileOrganization();
@@ -1669,10 +2043,9 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
 
         // Drain any messages queued while IsCreating was true.
         // The user may have typed and sent a message before SDK creation finished.
-        if (state.Info.MessageQueue.Count > 0)
+        var nextPrompt = state.Info.MessageQueue.TryDequeue();
+        if (nextPrompt != null)
         {
-            var nextPrompt = state.Info.MessageQueue[0];
-            state.Info.MessageQueue.RemoveAt(0);
             List<string>? nextImagePaths = null;
             lock (_imageQueueLock)
             {
@@ -1696,7 +2069,30 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 }
             }
             Debug($"[CREATE] Draining queued message for newly created session '{name}'");
-            _ = SendPromptAsync(name, nextPrompt, imagePaths: nextImagePaths, agentMode: nextAgentMode)
+            // Check if the session is an orchestrator — route through multi-agent pipeline if so.
+            // CreateSessionAsync runs on UI thread, so Organization reads are safe here.
+            var createOrchGroupId = GetOrchestratorGroupId(name);
+            if (createOrchGroupId != null && nextImagePaths is { Count: > 0 })
+            {
+                Debug($"[CREATE] Orchestrator '{name}' — images present, sending direct (orchestration does not support images)");
+                if (_sessions.TryGetValue(name, out var imgState))
+                {
+                    imgState.Info.History.Add(ChatMessage.SystemMessage(
+                        "⚠️ Images sent directly — orchestration routing does not support images yet."));
+                    imgState.Info.MessageCount = imgState.Info.History.Count;
+                }
+            }
+            // Mirror Dashboard.razor's AutoStartReflectionIfNeeded behavior for OrchestratorReflect groups
+            if (createOrchGroupId != null && nextImagePaths is null or { Count: 0 })
+            {
+                var drainOrchGroup = Organization.Groups.FirstOrDefault(g => g.Id == createOrchGroupId);
+                if (drainOrchGroup?.OrchestratorMode == MultiAgentMode.OrchestratorReflect)
+                    StartGroupReflection(createOrchGroupId, nextPrompt, drainOrchGroup.MaxReflectIterations ?? 5);
+            }
+            var createDrainTask = createOrchGroupId != null && nextImagePaths is null or { Count: 0 }
+                ? SendToMultiAgentGroupAsync(createOrchGroupId, nextPrompt)
+                : SendPromptAsync(name, nextPrompt, imagePaths: nextImagePaths, agentMode: nextAgentMode);
+            _ = createDrainTask
                 .ContinueWith(t =>
                 {
                     if (t.IsFaulted)
@@ -1751,7 +2147,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 if (!Organization.Sessions.Any(m => m.SessionName == remoteName))
                 {
                     var repoGroup = Organization.Groups.FirstOrDefault(g => g.RepoId == repoId);
-                    Organization.Sessions.Add(new SessionMeta
+                    AddSessionMeta(new SessionMeta
                     {
                         SessionName = remoteName,
                         GroupId = repoGroup?.Id ?? SessionGroup.DefaultId
@@ -1855,10 +2251,13 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         if (!_sessions.TryGetValue(name, out var state)) return null;
 
         var workingDir = state.Info.WorkingDirectory;
+        // Preserve group assignment so the new session stays in the same group (e.g., codespace group)
+        var meta = Organization.Sessions.FirstOrDefault(m => m.SessionName == name);
+        var groupId = meta?.GroupId;
         
         await CloseSessionAsync(name);
         
-        return await CreateSessionAsync(name, newModel, workingDir);
+        return await CreateSessionAsync(name, newModel, workingDir, groupId: groupId);
     }
 
     /// <summary>
@@ -1911,6 +2310,9 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
 
         if (string.IsNullOrEmpty(state.Info.SessionId)) return false;
 
+        // Placeholder codespace sessions have Session = null until tunnel connects
+        if (state.Session == null) return false;
+
         Debug($"Switching model for '{sessionName}': {state.Info.Model} → {normalizedModel}");
 
         try
@@ -1918,18 +2320,28 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             // Dispose old session connection (may already be disposed if disconnected)
             try { await state.Session.DisposeAsync(); } catch { }
 
-            if (_client == null)
-                throw new InvalidOperationException("Client is not initialized");
+            // Use the correct client (codespace tunnel client for codespace sessions, main client otherwise)
+            var meta = Organization.Sessions.FirstOrDefault(m => m.SessionName == sessionName);
+            var client = GetClientForGroup(meta?.GroupId);
+
+            // For codespace sessions, use the codespace working directory instead of the local path
+            var switchWorkDir = state.Info.WorkingDirectory;
+            if (meta?.GroupId != null)
+            {
+                var switchGroup = Organization.Groups.FirstOrDefault(g => g.Id == meta.GroupId);
+                if (switchGroup?.IsCodespace == true && switchGroup.CodespaceWorkingDirectory != null)
+                    switchWorkDir = switchGroup.CodespaceWorkingDirectory;
+            }
 
             // Resume the same session ID with the new model
             var resumeConfig = new ResumeSessionConfig
             {
                 Model = normalizedModel,
-                WorkingDirectory = state.Info.WorkingDirectory,
+                WorkingDirectory = switchWorkDir,
                 Tools = new List<Microsoft.Extensions.AI.AIFunction> { ShowImageTool.CreateFunction() },
                 OnPermissionRequest = AutoApprovePermissions,
             };
-            var newSession = await _client.ResumeSessionAsync(state.Info.SessionId, resumeConfig, cancellationToken);
+            var newSession = await client.ResumeSessionAsync(state.Info.SessionId, resumeConfig, cancellationToken);
 
             // Build replacement state, preserving info/history
             state.Info.Model = normalizedModel;
@@ -2005,6 +2417,10 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         if (state.Info.IsCreating)
             throw new InvalidOperationException("Session is still being created. Please wait.");
 
+        // Placeholder codespace sessions have Session=null until the tunnel connects
+        if (state.Session == null)
+            throw new InvalidOperationException("This session is waiting for its codespace to connect. Please wait for the green status dot.");
+
         if (state.Info.IsProcessing)
             throw new InvalidOperationException("Session is already processing a request.");
 
@@ -2026,8 +2442,15 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         state.Info.ProcessingStartedAt = DateTime.UtcNow;
         state.Info.ToolCallCount = 0;
         state.Info.ProcessingPhase = 0; // Sending
+        state.Info.ClearPermissionDenials();
         Interlocked.Exchange(ref state.ActiveToolCallCount, 0); // Reset stale tool count from previous turn
         state.HasUsedToolsThisTurn = false; // Reset stale tool flag from previous turn
+        state.FallbackCanceledByTurnStart = false;
+        Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
+        Interlocked.Exchange(ref state.EventCountThisTurn, 0); // Reset event counter for zero-idle capture
+        Interlocked.Exchange(ref state.TurnEndReceivedAtTicks, 0);
+        // Cancel any pending TurnEnd→Idle fallback from the previous turn
+        CancelTurnEndFallback(state);
         state.IsMultiAgentSession = IsSessionInMultiAgentGroup(sessionName); // Cache for watchdog (UI thread safe)
         Debug($"[SEND] '{sessionName}' IsProcessing=true gen={Interlocked.Read(ref state.ProcessingGeneration)} (thread={Environment.CurrentManagedThreadId})");
         state.ResponseCompletion = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -2051,7 +2474,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
 
             // Write-through to DB
             if (!string.IsNullOrEmpty(state.Info.SessionId))
-                _ = _chatDb.AddMessageAsync(state.Info.SessionId, state.Info.History.Last());
+                SafeFireAndForget(_chatDb.AddMessageAsync(state.Info.SessionId, state.Info.History.Last()), "AddMessageAsync");
         }
         OnStateChanged?.Invoke();
 
@@ -2065,12 +2488,14 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 Prompt = prompt
             };
 
-            // NOTE: MessageOptions.Mode is reserved for routing ("immediate" = steer-without-abort,
-            // null = default enqueue). Do NOT set Mode to an agent mode string here.
-            // The .NET SDK has no public mechanism to set session agent mode (autopilot/plan/interactive).
-            // Agent mode is controlled by session-level configuration (system message, available tools)
-            // set at session creation time via SessionConfig. The agentMode parameter is preserved
-            // in the pipeline for queue dispatch, bridge forwarding, and future SDK support.
+            // MessageOptions.Mode supports interaction modes: "plan", "autopilot", "edit",
+            // or "immediate" (used by SteerSessionAsync for soft-steer).
+            // When the user selects Plan or Autopilot in the UI, pass it through to the SDK.
+            if (!string.IsNullOrEmpty(agentMode))
+            {
+                messageOptions.Mode = agentMode;
+                Debug($"[SEND] '{sessionName}' agentMode={agentMode}");
+            }
             
             // Attach images via SDK if available
             if (imagePaths != null && imagePaths.Count > 0)
@@ -2082,7 +2507,14 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             // Changing session.Model at runtime only updates the UI display.
             // To actually switch models, the session would need to be recreated.
             
-            await state.Session.SendAsync(messageOptions, cancellationToken);
+            // WORKAROUND: Pass CancellationToken.None to avoid SDK bug where StreamJsonRpc's
+            // StandardCancellationStrategy tries to serialize RequestId (not in SDK's JSON context).
+            // Cancellation is handled at the TCS level via ResponseCompletion.TrySetCanceled().
+            // NOTE: If SendAsync itself blocks (half-open TCP), watchdog completes TCS but we're
+            // stuck here. This is an edge case on mobile/codespace connections; true fix requires
+            // SDK-level timeout on the transport write.
+            // See: https://github.com/PureWeen/PolyPilot/issues/319
+            await state.Session.SendAsync(messageOptions, CancellationToken.None);
         }
         catch (Exception ex)
         {
@@ -2096,49 +2528,109 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                 try
                 {
                     try { await state.Session.DisposeAsync(); } catch { /* session may already be disposed */ }
-                    if (_client == null)
-                        throw new InvalidOperationException("Client is not initialized");
+                    
+                    // Use the correct client for codespace sessions (not always _client)
+                    var meta = Organization.Sessions.FirstOrDefault(m => m.SessionName == sessionName);
+                    var sessionGroupId = meta?.GroupId;
 
-                    // If the underlying connection is broken, recreate the client first
-                    if (IsConnectionError(ex))
+                    // For codespace sessions, don't try local persistent server reconnect —
+                    // the health check handles codespace reconnection automatically.
+                    var isCodespaceSession = sessionGroupId != null &&
+                        Organization.Groups.Any(g => g.Id == sessionGroupId && g.IsCodespace);
+                    if (isCodespaceSession)
+                        throw new InvalidOperationException(
+                            "Codespace connection lost. The health check will reconnect automatically. Please retry in a moment.");
+
+                    // If a previous reconnect failure left the client dead (null/uninitialized),
+                    // attempt lazy re-initialization so the session can self-heal.
+                    if (!isCodespaceSession && (!IsInitialized || _client == null))
                     {
-                        Debug("Connection error detected, recreating client before session reconnect...");
-                        var connSettings = _currentSettings ?? ConnectionSettings.Load();
-                        if (CurrentMode == ConnectionMode.Persistent &&
-                            !_serverManager.CheckServerRunning("127.0.0.1", connSettings.Port))
-                        {
-                            Debug("Persistent server not running, restarting...");
-                            var started = await _serverManager.StartServerAsync(connSettings.Port);
-                            if (!started)
-                            {
-                                Debug("Failed to restart persistent server");
-                                try { await _client.DisposeAsync(); } catch { }
-                                _client = null;
-                                IsInitialized = false;
-                                throw;
-                            }
-                        }
-                        try { await _client.DisposeAsync(); } catch { }
+                        Debug("Client not initialized (previous failure), attempting lazy re-initialization...");
                         try
                         {
-                            _client = CreateClient(connSettings);
+                            var reinitSettings = _currentSettings ?? ConnectionSettings.Load();
+                            if (CurrentMode == ConnectionMode.Persistent &&
+                                !_serverManager.CheckServerRunning("127.0.0.1", reinitSettings.Port))
+                            {
+                                await _serverManager.StartServerAsync(reinitSettings.Port);
+                            }
+                            _client = CreateClient(reinitSettings);
                             await _client.StartAsync(cancellationToken);
-                            Debug("Client recreated successfully");
+                            IsInitialized = true;
+                            Debug("Lazy re-initialization succeeded");
                         }
-                        catch (OperationCanceledException)
+                        catch (Exception reinitEx)
                         {
-                            try { if (_client != null) await _client.DisposeAsync(); } catch { }
-                            _client = null;
-                            IsInitialized = false;
-                            throw;
+                            Debug($"Lazy re-initialization failed: {reinitEx.Message}");
                         }
-                        catch (Exception clientEx)
+                    }
+
+                    var client = GetClientForGroup(sessionGroupId);
+                    if (client == null)
+                        throw new InvalidOperationException("Client is not initialized");
+
+                    // If the underlying connection is broken, recreate the client first.
+                    // Serialize via _clientReconnectLock so concurrent workers don't each
+                    // dispose+recreate _client (thundering herd — only the first one reconnects).
+                    if (IsConnectionError(ex))
+                    {
+                        Debug($"Connection error detected for '{sessionName}', acquiring reconnect lock...");
+                        await _clientReconnectLock.WaitAsync(cancellationToken);
+                        try
                         {
-                            Debug($"Failed to recreate client: {clientEx.Message}");
-                            try { if (_client != null) await _client.DisposeAsync(); } catch { }
-                            _client = null;
-                            IsInitialized = false;
-                            throw;
+                            // Double-check: another worker may have already reconnected while we waited.
+                            // Compare references — if _client changed, someone else already recreated it.
+                            if (!ReferenceEquals(_client, client))
+                            {
+                                Debug($"Client already reconnected by another worker, skipping recreate for '{sessionName}'");
+                                client = _client;
+                            }
+                            else
+                            {
+                                Debug("Recreating client after connection error...");
+                                var connSettings = _currentSettings ?? ConnectionSettings.Load();
+                                if (CurrentMode == ConnectionMode.Persistent &&
+                                    !_serverManager.CheckServerRunning("127.0.0.1", connSettings.Port))
+                                {
+                                    Debug("Persistent server not running, restarting...");
+                                    var started = await _serverManager.StartServerAsync(connSettings.Port);
+                                    if (!started)
+                                    {
+                                        Debug("Failed to restart persistent server");
+                                        try { await _client.DisposeAsync(); } catch { }
+                                        _client = null;
+                                        IsInitialized = false;
+                                        throw;
+                                    }
+                                }
+                                try { await _client.DisposeAsync(); } catch { }
+                                try
+                                {
+                                    _client = CreateClient(connSettings);
+                                    await _client.StartAsync(cancellationToken);
+                                    client = _client;
+                                    Debug("Client recreated successfully");
+                                }
+                                catch (OperationCanceledException)
+                                {
+                                    try { if (_client != null) await _client.DisposeAsync(); } catch { }
+                                    _client = null;
+                                    IsInitialized = false;
+                                    throw;
+                                }
+                                catch (Exception clientEx)
+                                {
+                                    Debug($"Failed to recreate client: {clientEx.Message}");
+                                    try { if (_client != null) await _client.DisposeAsync(); } catch { }
+                                    _client = null;
+                                    IsInitialized = false;
+                                    throw;
+                                }
+                            }
+                        }
+                        finally
+                        {
+                            _clientReconnectLock.Release();
                         }
                     }
 
@@ -2150,11 +2642,32 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                         reconnectConfig.Model = reconnectModel;
                     if (!string.IsNullOrEmpty(state.Info.WorkingDirectory))
                         reconnectConfig.WorkingDirectory = state.Info.WorkingDirectory;
-                    var newSession = await _client.ResumeSessionAsync(state.Info.SessionId, reconnectConfig, cancellationToken);
-                    // Cancel old watchdog BEFORE creating new state — they share Info/TCS
+                    
+                    CopilotSession newSession;
+                    try
+                    {
+                        newSession = await client.ResumeSessionAsync(state.Info.SessionId, reconnectConfig, cancellationToken);
+                    }
+                    catch (Exception resumeEx) when (resumeEx.Message.Contains("Session not found", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Session expired server-side (e.g., codespace restarted). Create a fresh session
+                        // with full config (MCP servers, skills, system message) matching CreateSessionAsync.
+                        Debug($"Session '{sessionName}' expired on server, creating fresh session...");
+                        OnActivity?.Invoke(sessionName, "🔄 Session expired, creating new session...");
+                        var freshConfig = BuildFreshSessionConfig(state);
+                        newSession = await client.CreateSessionAsync(freshConfig, cancellationToken);
+                        state.Info.SessionId = newSession.SessionId;
+                    }
+                    // Cancel old watchdog AND TurnEnd fallback BEFORE creating new state — they share Info/TCS
                     CancelProcessingWatchdog(state);
+                    CancelTurnEndFallback(state);
+                    CancelToolHealthCheck(state);
                     Debug($"[RECONNECT] '{sessionName}' replacing state (old handler will be orphaned, " +
                           $"old session disposed, new session={newSession.SessionId})");
+                    // Preserve accumulated response content from the old state.
+                    // FlushedResponse contains text from earlier FlushCurrentResponse calls —
+                    // this is real output the worker produced before the connection died.
+                    var preservedFlushed = state.FlushedResponse.ToString();
                     var newState = new SessionState
                     {
                         Session = newSession,
@@ -2165,7 +2678,14 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     // orphaned old state can't pass generation checks on the new state.
                     Interlocked.Exchange(ref newState.ProcessingGeneration,
                         Interlocked.Read(ref state.ProcessingGeneration));
-                    newState.HasUsedToolsThisTurn = state.HasUsedToolsThisTurn;
+                    // Reset tool tracking for the NEW connection. The old connection's
+                    // tool state is stale — no tools have run on this connection yet.
+                    // Without this, HasUsedToolsThisTurn=true from the dead connection
+                    // inflates the watchdog timeout from 120s to 600s, making stuck
+                    // sessions wait 5x longer than necessary to recover.
+                    newState.HasUsedToolsThisTurn = false;
+                    Interlocked.Exchange(ref newState.ActiveToolCallCount, 0);
+                    Interlocked.Exchange(ref newState.SuccessfulToolCountThisTurn, 0);
                     newState.IsMultiAgentSession = state.IsMultiAgentSession;
                     newSession.On(evt => HandleSessionEvent(newState, evt));
                     _sessions[sessionName] = newState;
@@ -2177,11 +2697,35 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     // replayed IDLE from clearing IsProcessing before the retry completes.
                     Interlocked.Increment(ref state.ProcessingGeneration);
                     state.Info.IsProcessing = true;
+                    // Reset ProcessingStartedAt so the watchdog's max-time safety net
+                    // measures from the reconnect, not the original send. Without this,
+                    // the 60-min absolute max is measured from the first attempt and
+                    // the reconnected session inherits a stale deadline.
+                    state.Info.ProcessingStartedAt = DateTime.UtcNow;
                     state.CurrentResponse.Clear();
+                    // Carry forward accumulated response from the old state so
+                    // CompleteResponse can include it in the TCS result. Without
+                    // this, reconnect loses all content flushed before the retry.
                     state.FlushedResponse.Clear();
+                    if (!string.IsNullOrEmpty(preservedFlushed))
+                    {
+                        state.FlushedResponse.Append(preservedFlushed);
+                        Debug($"[RECONNECT] '{sessionName}' preserved {preservedFlushed.Length} chars of flushed response");
+                    }
                     state.PendingReasoningMessages.Clear();
                     Debug($"[RECONNECT] '{sessionName}' reset processing state: gen={Interlocked.Read(ref state.ProcessingGeneration)}");
                     
+                    // Reset HasUsedToolsThisTurn so the retried turn starts with the default
+                    // 120s watchdog tier instead of the inflated 600s from stale tool state.
+                    state.HasUsedToolsThisTurn = false;
+
+                    // Schedule persistence of the new session ID so it survives app restart.
+                    // Without this, the debounced save captures the pre-reconnect snapshot
+                    // and the stale session ID is written to active-sessions.json.
+                    // Note: This is debounced (2s). If the app crashes within that window,
+                    // the fallback path in RestorePreviousSessionsAsync handles it gracefully.
+                    SaveActiveSessionsToDisk();
+
                     // Start fresh watchdog for the new connection
                     StartProcessingWatchdog(state, sessionName);
                     
@@ -2190,7 +2734,11 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     {
                         Prompt = prompt
                     };
-                    await state.Session.SendAsync(retryOptions, cancellationToken);
+                    if (!string.IsNullOrEmpty(agentMode))
+                        retryOptions.Mode = agentMode;
+                    // WORKAROUND: Pass CancellationToken.None (same reason as primary send path).
+                    // Same watchdog limitation applies here.
+                    await state.Session.SendAsync(retryOptions, CancellationToken.None);
                     Debug($"[RECONNECT] '{sessionName}' SendAsync completed after reconnect — awaiting events");
                 }
                 catch (Exception retryEx)
@@ -2198,10 +2746,13 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
                     Console.WriteLine($"[DEBUG] Reconnect+retry failed: {retryEx.Message}");
                     OnError?.Invoke(sessionName, $"Session disconnected and reconnect failed: {Models.ErrorMessageHelper.Humanize(retryEx)}");
                     CancelProcessingWatchdog(state);
+                    CancelTurnEndFallback(state);
+                    CancelToolHealthCheck(state);
                     FlushCurrentResponse(state);
                     Debug($"[ERROR] '{sessionName}' reconnect+retry failed, clearing IsProcessing");
                     Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                     state.HasUsedToolsThisTurn = false;
+                    Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
                     state.Info.IsResumed = false;
                     state.Info.IsProcessing = false;
                     if (state.Info.ProcessingStartedAt is { } rcStarted)
@@ -2217,10 +2768,13 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             {
                 OnError?.Invoke(sessionName, $"SendAsync failed: {Models.ErrorMessageHelper.Humanize(ex)}");
                 CancelProcessingWatchdog(state);
+                CancelTurnEndFallback(state);
+                CancelToolHealthCheck(state);
                 FlushCurrentResponse(state);
                 Debug($"[ERROR] '{sessionName}' SendAsync failed, clearing IsProcessing (error={ex.Message})");
                 Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                 state.HasUsedToolsThisTurn = false;
+                Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
                 state.Info.IsResumed = false;
                 state.Info.IsProcessing = false;
                 if (state.Info.ProcessingStartedAt is { } saStarted)
@@ -2251,6 +2805,56 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         }
     }
 
+    /// <summary>
+    /// Build a fresh SessionConfig with MCP servers, skill directories, and system message.
+    /// Mirrors the reconnect handler's "Session not found" path to ensure revived/fresh sessions
+    /// have full external tool access.
+    /// </summary>
+    private SessionConfig BuildFreshSessionConfig(SessionState state, List<Microsoft.Extensions.AI.AIFunction>? tools = null)
+    {
+        var settings = _currentSettings ?? ConnectionSettings.Load();
+        var mcpServers = LoadMcpServers(settings.DisabledMcpServers, settings.DisabledPlugins);
+        var skillDirs = LoadSkillDirectories(settings.DisabledPlugins);
+        var systemContent = new StringBuilder();
+        var workDir = state.Info.WorkingDirectory;
+        if (string.Equals(workDir, ProjectDir, StringComparison.OrdinalIgnoreCase))
+        {
+            var relaunchCmd = OperatingSystem.IsWindows()
+                ? $"powershell -ExecutionPolicy Bypass -File \"{Path.Combine(ProjectDir, "relaunch.ps1")}\""
+                : $"bash {Path.Combine(ProjectDir, "relaunch.sh")}";
+            systemContent.AppendLine($@"
+CRITICAL BUILD INSTRUCTION: You are running inside the PolyPilot MAUI application.
+When you make ANY code changes to files in {ProjectDir}, you MUST rebuild and relaunch by running:
+
+    {relaunchCmd}
+
+This script builds the app, launches a new instance, waits for it to start, then kills the old one.
+NEVER use 'dotnet build' + 'open' separately. NEVER skip the relaunch after code changes.
+ALWAYS run the relaunch script as the final step after making changes to this project.
+");
+        }
+        var finalTools = tools ?? new List<Microsoft.Extensions.AI.AIFunction> { ShowImageTool.CreateFunction() };
+        var config = new SessionConfig
+        {
+            Model = Models.ModelHelper.NormalizeToSlug(state.Info.Model) ?? DefaultModel,
+            WorkingDirectory = workDir,
+            McpServers = mcpServers,
+            SkillDirectories = skillDirs,
+            Tools = finalTools,
+            SystemMessage = new SystemMessageConfig
+            {
+                Mode = SystemMessageMode.Append,
+                Content = systemContent.ToString()
+            },
+            OnPermissionRequest = AutoApprovePermissions
+        };
+        if (mcpServers != null)
+            Debug($"[FRESH-CONFIG] Includes {mcpServers.Count} MCP server(s)");
+        if (skillDirs != null)
+            Debug($"[FRESH-CONFIG] Includes {skillDirs.Count} skill dir(s)");
+        return config;
+    }
+
     public async Task AbortSessionAsync(string sessionName, bool markAsInterrupted = false)
     {
         // Provider sessions manage their own cancellation
@@ -2279,8 +2883,8 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
 
         if (!state.Info.IsProcessing) return;
 
-        // In demo mode, Session is null — skip the SDK abort call
-        if (!IsDemoMode)
+        // In demo mode or placeholder codespace sessions, Session is null — skip the SDK abort call
+        if (!IsDemoMode && state.Session != null)
         {
             try
             {
@@ -2304,7 +2908,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             state.Info.History.Add(msg);
             state.Info.MessageCount = state.Info.History.Count;
             if (!string.IsNullOrEmpty(state.Info.SessionId))
-                _ = _chatDb.AddMessageAsync(state.Info.SessionId, msg);
+                SafeFireAndForget(_chatDb.AddMessageAsync(state.Info.SessionId, msg), "AddMessageAsync");
         }
         state.CurrentResponse.Clear();
 
@@ -2318,16 +2922,25 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         state.Info.ProcessingPhase = 0;
         Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
         state.HasUsedToolsThisTurn = false;
+        Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
         // Release send lock — allows a subsequent SteerSessionAsync to acquire it immediately
         Interlocked.Exchange(ref state.SendingFlag, 0);
         // Clear queued messages so they don't auto-send after abort
         state.Info.MessageQueue.Clear();
         _queuedImagePaths.TryRemove(sessionName, out _);
         _queuedAgentModes.TryRemove(sessionName, out _);
+        _permissionRecoveryAttempts.TryRemove(sessionName, out _);
+        // Cancel any pending TurnEnd→Idle fallback so it doesn't fire CompleteResponse after abort
+        CancelTurnEndFallback(state);
         CancelProcessingWatchdog(state);
+        CancelToolHealthCheck(state);
         state.FlushedResponse.Clear();
         state.PendingReasoningMessages.Clear();
+        state.Info.ClearPermissionDenials(); // INV-1: clear on all termination paths
+        // Complete TCS AFTER state cleanup (INV-O3)
         state.ResponseCompletion?.TrySetCanceled();
+        // Fire completion notification so orchestrator loops are unblocked (INV-O4)
+        OnSessionComplete?.Invoke(sessionName, "[Abort] user cancelled");
         OnStateChanged?.Invoke();
     }
 
@@ -2351,7 +2964,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             return;
         }
 
-        bool toolsActiveOrUsed = Volatile.Read(ref state.ActiveToolCallCount) > 0 || Volatile.Read(ref state.HasUsedToolsThisTurn);
+        bool toolsActiveOrUsed = Volatile.Read(ref state.ActiveToolCallCount) > 0 || state.HasUsedToolsThisTurn;
 
         // Soft steer is only available for real SDK sessions (not demo/remote which lack CopilotSession).
         if (state.Info.IsProcessing && toolsActiveOrUsed && !IsDemoMode && !IsRemoteMode && state.Session != null)
@@ -2380,11 +2993,13 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             bool softSteerSucceeded = false;
             try
             {
+                // NOTE: No cancellationToken passed (implicitly CancellationToken.None).
+                // This is intentional — see issue #319 for the SDK RequestId serialization bug.
                 await state.Session.SendAsync(softSteerOptions);
                 softSteerSucceeded = true;
                 // Write to DB only after successful send to avoid orphaned entries on connection errors.
                 if (!string.IsNullOrEmpty(state.Info.SessionId))
-                    _ = _chatDb.AddMessageAsync(state.Info.SessionId, userMsg);
+                    SafeFireAndForget(_chatDb.AddMessageAsync(state.Info.SessionId, userMsg), "AddMessageAsync");
             }
             catch (Exception ex) when (IsConnectionError(ex))
             {
@@ -2407,25 +3022,33 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             {
                 OnError?.Invoke(sessionName, $"Soft steer failed: {Models.ErrorMessageHelper.Humanize(ex)}");
                 CancelProcessingWatchdog(state);
+                CancelTurnEndFallback(state);
+                CancelToolHealthCheck(state);
                 FlushCurrentResponse(state);
                 Debug($"[STEER-ERROR] '{sessionName}' soft steer SendAsync failed, clearing IsProcessing (error={ex.Message})");
                 Interlocked.Exchange(ref state.ActiveToolCallCount, 0);
                 state.HasUsedToolsThisTurn = false;
+                Interlocked.Exchange(ref state.SuccessfulToolCountThisTurn, 0);
                 state.Info.IsResumed = false;
                 Interlocked.Exchange(ref state.SendingFlag, 0);
-                state.ResponseCompletion?.TrySetCanceled();
+                // Clear IsProcessing BEFORE completing TCS (INV-O3)
                 state.Info.IsProcessing = false;
                 if (state.Info.ProcessingStartedAt is { } steerStarted)
                     state.Info.TotalApiTimeSeconds += (DateTime.UtcNow - steerStarted).TotalSeconds;
                 state.Info.ProcessingStartedAt = null;
                 state.Info.ToolCallCount = 0;
                 state.Info.ProcessingPhase = 0;
+                state.Info.ClearPermissionDenials(); // INV-1: clear on all termination paths
                 // Clear queued messages so stale entries don't auto-send on the next successful turn
                 state.Info.MessageQueue.Clear();
                 _queuedImagePaths.TryRemove(sessionName, out _);
                 _queuedAgentModes.TryRemove(sessionName, out _);
                 state.FlushedResponse.Clear();
                 state.PendingReasoningMessages.Clear();
+                // Complete TCS AFTER state cleanup (INV-O3)
+                state.ResponseCompletion?.TrySetCanceled();
+                // Fire completion notification so orchestrator loops are unblocked (INV-O4)
+                OnSessionComplete?.Invoke(sessionName, "[SteerError] soft steer failed");
                 OnStateChanged?.Invoke();
                 return;
             }
@@ -2457,7 +3080,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         if (!_sessions.TryGetValue(sessionName, out var state))
             throw new InvalidOperationException($"Session '{sessionName}' not found.");
 
-        state.Info.MessageQueue.Add(prompt);
+        var queueCount = state.Info.MessageQueue.AddAndGetCount(prompt);
         
         // Track image paths alongside the queued message
         if (imagePaths != null && imagePaths.Count > 0)
@@ -2465,7 +3088,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             lock (_imageQueueLock)
             {
                 var queue = _queuedImagePaths.GetOrAdd(sessionName, _ => new List<List<string>>());
-                while (queue.Count < state.Info.MessageQueue.Count - 1)
+                while (queue.Count < queueCount - 1)
                     queue.Add(new List<string>());
                 queue.Add(imagePaths);
             }
@@ -2477,7 +3100,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             lock (_imageQueueLock)
             {
                 var modes = _queuedAgentModes.GetOrAdd(sessionName, _ => new List<string?>());
-                while (modes.Count < state.Info.MessageQueue.Count - 1)
+                while (modes.Count < queueCount - 1)
                     modes.Add(null);
                 modes.Add(agentMode);
             }
@@ -2529,9 +3152,8 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         if (!_sessions.TryGetValue(sessionName, out var state))
             return;
         
-        if (index >= 0 && index < state.Info.MessageQueue.Count)
+        if (state.Info.MessageQueue.TryRemoveAt(index))
         {
-            state.Info.MessageQueue.RemoveAt(index);
             // Keep queued image paths in sync
             lock (_imageQueueLock)
             {
@@ -2843,7 +3465,7 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         // trigger a second OnStateChanged, causing rapid render batch churn that crashes
         // Blazor with "r.parentNode.removeChild" on null (render batch ordering race).
         // Instead, directly remove from Organization.Sessions so the deletion persists across restarts.
-        Organization.Sessions.RemoveAll(m => m.SessionName == name);
+        RemoveSessionMetasWhere(m => m.SessionName == name);
         if (notifyUi)
             OnStateChanged?.Invoke();
         if (!IsRemoteMode)
@@ -2851,6 +3473,11 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
             SaveActiveSessionsToDisk();
             FlushSaveOrganization();
         }
+
+        // Cancel any pending timers so they don't fire on torn-down state after session removal
+        CancelProcessingWatchdog(state);
+        CancelTurnEndFallback(state);
+        CancelToolHealthCheck(state);
 
         // Dispose the SDK session AFTER UI has updated — DisposeAsync talks to the CLI
         // process and may trigger additional SDK events on background threads. Running it
@@ -2878,12 +3505,14 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
     }
 
     public IEnumerable<AgentSessionInfo> GetAllSessions() => _sessions.Values.Select(s => s.Info).Where(s => !s.IsHidden);
+    public IEnumerable<string> GetAllSessionNames() => _sessions.Keys;
 
     public int SessionCount => _sessions.Count;
 
     public async ValueTask DisposeAsync()
     {
         StopConnectivityMonitoring();
+        await StopCodespaceHealthCheckAsync();
 
         // Flush any pending debounced writes immediately
         FlushSaveActiveSessionsToDisk();
@@ -2891,10 +3520,15 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
         _saveUiStateDebounce?.Dispose();
         _saveUiStateDebounce = null;
         FlushUiState();
-        
+
+        _stateChangedCoalesceTimer?.Dispose();
+        _stateChangedCoalesceTimer = null;
+
         foreach (var state in _sessions.Values)
         {
             CancelProcessingWatchdog(state);
+            CancelTurnEndFallback(state);
+            CancelToolHealthCheck(state);
             if (state.Session is not null)
                 try { await state.Session.DisposeAsync(); } catch { }
         }
@@ -2902,6 +3536,17 @@ ALWAYS run the relaunch script as the final step after making changes to this pr
 
         // Shut down all registered providers
         await ShutdownProvidersAsync();
+
+        foreach (var kv in _codespaceClients)
+        {
+            try { await kv.Value.DisposeAsync(); } catch { }
+        }
+        _codespaceClients.Clear();
+        foreach (var kv in _tunnelHandles)
+        {
+            try { await kv.Value.DisposeAsync(); } catch { }
+        }
+        _tunnelHandles.Clear();
 
         if (_client != null)
         {
@@ -2929,6 +3574,7 @@ public class ActiveSessionEntry
     public string Model { get; set; } = "";
     public string? WorkingDirectory { get; set; }
     public string? LastPrompt { get; set; }
+    public string? GroupId { get; set; }
     // Usage stats persisted across reconnects
     public int TotalInputTokens { get; set; }
     public int TotalOutputTokens { get; set; }

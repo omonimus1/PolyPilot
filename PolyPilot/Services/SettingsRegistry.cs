@@ -135,32 +135,6 @@ public static class SettingsRegistry
             SearchKeywords = "save reconnect apply restart",
         });
 
-        // ── Copilot CLI ─────────────────────────────────────────────
-
-        list.Add(new SettingDescriptor
-        {
-            Id = "cli.source",
-            Label = "CLI Source",
-            Description = "Use the CLI bundled with the app or one installed on your system.",
-            Category = "Copilot CLI",
-            Type = SettingType.CardEnum,
-            Order = 10,
-            SearchKeywords = "cli source built-in system version binary copilot",
-            Options = new[]
-            {
-                new SettingOption("BuiltIn", "📦 Built-in"),
-                new SettingOption("System", "💻 System"),
-            },
-            GetValue = ctx => ctx.Settings.CliSource.ToString(),
-            SetValue = (ctx, v) =>
-            {
-                if (v is string s && Enum.TryParse<CliSourceMode>(s, out var src))
-                    ctx.Settings.CliSource = src;
-            },
-            IsVisible = ctx => ctx.Settings.Mode != ConnectionMode.Remote
-                            && ctx.Settings.Mode != ConnectionMode.Demo
-        });
-
         // ── UI ──────────────────────────────────────────────────────
 
         list.Add(new SettingDescriptor
@@ -310,6 +284,25 @@ public static class SettingsRegistry
 
         list.Add(new SettingDescriptor
         {
+            Id = "ui.muteWorkerNotifications",
+            Label = "Mute Worker Notifications",
+            Description = "Don't send notifications for worker sessions in multi-agent groups.",
+            Category = "UI",
+            Section = "Notifications",
+            Type = SettingType.Bool,
+            Order = 61,
+            SearchKeywords = "notifications worker multi-agent mute quiet",
+            IsVisible = ctx => ctx.Settings.EnableSessionNotifications,
+            GetValue = ctx => ctx.Settings.MuteWorkerNotifications,
+            SetValue = (ctx, v) =>
+            {
+                if (v is bool b)
+                    ctx.Settings.MuteWorkerNotifications = b;
+            }
+        });
+
+        list.Add(new SettingDescriptor
+        {
             Id = "ui.editor",
             Label = "Editor",
             Description = "Which VS Code variant to launch from session menus.",
@@ -332,7 +325,51 @@ public static class SettingsRegistry
             IsVisible = ctx => ctx.IsDesktop
         });
 
+        list.Add(new SettingDescriptor
+        {
+            Id = "ui.codespaces",
+            Label = "Codespaces",
+            Description = "⚠️ Alpha — Enable GitHub Codespaces integration. Requires Embedded mode. Adds the ability to connect sessions to running codespaces via SSH tunnels.",
+            Category = "UI",
+            Section = "Features",
+            Type = SettingType.Bool,
+            Order = 65,
+            SearchKeywords = "codespaces github cloud remote ssh tunnel embedded",
+            GetValue = ctx => ctx.Settings.CodespacesEnabled,
+            SetValue = (ctx, v) =>
+            {
+                // Only allow enabling in Embedded mode; always allow disabling
+                if (v is bool b && (ctx.InitialMode == ConnectionMode.Embedded || !b))
+                    ctx.Settings.CodespacesEnabled = b;
+            },
+            IsVisible = ctx => ctx.IsDesktop
+        });
+
         // ── Developer ───────────────────────────────────────────────
+
+        list.Add(new SettingDescriptor
+        {
+            Id = "cli.source",
+            Label = "CLI Source",
+            Description = "Use the CLI bundled with the app or one installed on your system.",
+            Category = "Developer",
+            Type = SettingType.CardEnum,
+            Order = 5,
+            SearchKeywords = "cli source built-in system version binary copilot",
+            Options = new[]
+            {
+                new SettingOption("BuiltIn", "📦 Built-in"),
+                new SettingOption("System", "💻 System"),
+            },
+            GetValue = ctx => ctx.Settings.CliSource.ToString(),
+            SetValue = (ctx, v) =>
+            {
+                if (v is string s && Enum.TryParse<CliSourceMode>(s, out var src))
+                    ctx.Settings.CliSource = src;
+            },
+            IsVisible = ctx => ctx.Settings.Mode != ConnectionMode.Remote
+                            && ctx.Settings.Mode != ConnectionMode.Demo
+        });
 
         list.Add(new SettingDescriptor
         {

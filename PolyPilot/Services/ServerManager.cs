@@ -75,6 +75,7 @@ public class ServerManager : IServerManager
 
             // Use ArgumentList for proper escaping (especially MCP JSON)
             psi.ArgumentList.Add("--headless");
+            psi.ArgumentList.Add("--no-auto-update");
             psi.ArgumentList.Add("--log-level");
             psi.ArgumentList.Add("info");
             psi.ArgumentList.Add("--port");
@@ -94,15 +95,13 @@ public class ServerManager : IServerManager
             SavePidFile(process.Id, port);
             Console.WriteLine($"[ServerManager] Started copilot server PID {process.Id} on port {port}");
 
-            // Detach stdout/stderr readers so they don't hold the process
-            _ = Task.Run(async () =>
-            {
-                try { while (await process.StandardOutput.ReadLineAsync() != null) { } } catch { }
-            });
-            _ = Task.Run(async () =>
-            {
-                try { while (await process.StandardError.ReadLineAsync() != null) { } } catch { }
-            });
+            // Drain stdout/stderr in parallel; dispose process handle when both streams close.
+            // The server process itself keeps running — we only release the OS handle.
+            // Must be parallel: sequential draining deadlocks if stderr fills its pipe buffer
+            // while stdout drain blocks waiting for the process to exit.
+            var t1 = Task.Run(async () => { try { while (await process.StandardOutput.ReadLineAsync() != null) { } } catch { } });
+            var t2 = Task.Run(async () => { try { while (await process.StandardError.ReadLineAsync() != null) { } } catch { } });
+            _ = Task.WhenAll(t1, t2).ContinueWith(_ => process.Dispose());
 
             // Wait for server to become available
             for (int i = 0; i < 15; i++)
@@ -139,6 +138,7 @@ public class ServerManager : IServerManager
             {
                 var process = Process.GetProcessById(pid.Value);
                 process.Kill();
+                process.Dispose();
                 Console.WriteLine($"[ServerManager] Killed server PID {pid}");
             }
             catch (Exception ex)
@@ -208,7 +208,12 @@ public class ServerManager : IServerManager
 
     private static string FindCopilotBinary()
     {
-        // Try platform-specific native binaries first (faster startup, better detachment)
+        // Prefer the SDK-bundled binary — it's guaranteed to match the SDK's protocol version.
+        // System-installed CLIs may have been updated independently and could have a mismatched protocol.
+        var bundledPath = CopilotService.ResolveBundledCliPath();
+        if (bundledPath != null) return bundledPath;
+
+        // Fall back to platform-specific native binaries (system-installed)
         var nativePaths = new List<string>();
 
         if (OperatingSystem.IsWindows())
@@ -235,10 +240,6 @@ public class ServerManager : IServerManager
         {
             if (File.Exists(path)) return path;
         }
-
-        // Try the bundled binary from the SDK (MonoBundle/copilot or runtimes/{rid}/native/copilot)
-        var bundledPath = CopilotService.ResolveBundledCliPath();
-        if (bundledPath != null) return bundledPath;
 
         // Fallback to node wrapper (works if copilot is on PATH)
         return OperatingSystem.IsWindows() ? "copilot.cmd" : "copilot";

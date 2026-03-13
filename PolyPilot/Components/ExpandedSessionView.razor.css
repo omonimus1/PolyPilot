@@ -39,7 +39,7 @@
 .info-panel {
     position: absolute;
     top: calc(100% + 4px);
-    right: -0.5rem;
+    left: 0;
     background: var(--bg-tertiary);
     border: 1px solid var(--control-border);
     border-radius: 8px;
@@ -672,3 +672,5 @@
     .expanded-card .input-area textarea { font-size: var(--type-callout, 0.8rem); max-height: 30dvh; }
     .input-status-bar { gap: 0.4rem; }
 }
+
+

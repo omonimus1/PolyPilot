@@ -692,8 +692,9 @@ That covers the full task.";
     }
 
     [Fact]
-    public void ParseTaskAssignments_FuzzyMatchesWorkerNames()
+    public void ParseTaskAssignments_ExactMatchOnly_NoFuzzy()
     {
+        // With exact-match-only, "session" does NOT match "session-alpha"
         var response = @"@worker:session
 Do the work.
 @end";
@@ -701,8 +702,7 @@ Do the work.
         var workers = new List<string> { "session-alpha", "session-beta" };
         var assignments = CopilotService.ParseTaskAssignments(response, workers);
 
-        Assert.Single(assignments);
-        Assert.Equal("session-alpha", assignments[0].WorkerName);
+        Assert.Empty(assignments); // No exact match for "session"
     }
 
     [Fact]
@@ -1364,6 +1364,22 @@ public class GroupPresetTests
         Assert.NotNull(prSquad.WorkerSystemPrompts);
         Assert.Equal(prSquad.WorkerModels.Length, prSquad.WorkerSystemPrompts!.Length);
     }
+
+    [Fact]
+    public void BuiltInPresets_IncludeSkillValidator()
+    {
+        var skillValidator = GroupPreset.BuiltIn.FirstOrDefault(p => p.Name == "Skill Validator");
+        Assert.NotNull(skillValidator);
+        Assert.Equal(3, skillValidator!.WorkerModels.Length);
+        Assert.Equal(MultiAgentMode.OrchestratorReflect, skillValidator.Mode);
+        Assert.Equal("⚖️", skillValidator.Emoji);
+        Assert.NotNull(skillValidator.SharedContext);
+        Assert.NotNull(skillValidator.RoutingContext);
+        Assert.NotNull(skillValidator.WorkerSystemPrompts);
+        Assert.Equal(3, skillValidator.WorkerSystemPrompts!.Length);
+        Assert.All(skillValidator.WorkerSystemPrompts, p => Assert.False(string.IsNullOrWhiteSpace(p)));
+        Assert.NotNull(skillValidator.MaxReflectIterations);
+    }
 }
 
 public class GroupModelAnalyzerTests
@@ -1766,7 +1782,7 @@ public class MultiAgentScenarioTests
     /// 
     /// User flow:
     ///   1. Click 🚀 Preset in sidebar toolbar
-    ///   2. Preset picker appears showing 2 built-in templates
+    ///   2. Preset picker appears showing 3 built-in templates
     ///   3. Select "PR Review Squad" (📋)
     ///   4. System creates: Orchestrator (claude-opus-4.6) + 5 Workers
     ///   5. Sidebar shows group with mode selector set to "🎯 Orchestrator"
@@ -1777,7 +1793,7 @@ public class MultiAgentScenarioTests
     {
         // Step 1-2: User sees built-in presets
         var presets = GroupPreset.BuiltIn;
-        Assert.Equal(2, presets.Length);
+        Assert.Equal(3, presets.Length);
 
         // Step 3: User picks "PR Review Squad"
         var prReview = presets.First(p => p.Name == "PR Review Squad");
@@ -3498,6 +3514,50 @@ public class GroupingStabilityTests
             Assert.NotNull(timer); // Timer was created by SaveOrganization
 
             // Clean up: flush to cancel the timer and write
+            svc.FlushSaveOrganization();
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void UnpinnedCollapsed_DefaultsFalse()
+    {
+        var group = new SessionGroup { Name = "Test" };
+        Assert.False(group.UnpinnedCollapsed);
+    }
+
+    [Fact]
+    public void UnpinnedCollapsed_SerializesRoundTrip()
+    {
+        var group = new SessionGroup { Name = "Test", UnpinnedCollapsed = true };
+        var json = System.Text.Json.JsonSerializer.Serialize(group);
+        var deserialized = System.Text.Json.JsonSerializer.Deserialize<SessionGroup>(json)!;
+        Assert.True(deserialized.UnpinnedCollapsed);
+    }
+
+    [Fact]
+    public void ToggleUnpinnedCollapsed_TogglesState()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"polypilot-test-{Guid.NewGuid()}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            CopilotService.SetBaseDirForTesting(tempDir);
+            var svc = new CopilotService(
+                new StubChatDatabase(), new StubServerManager(), new StubWsBridgeClient(),
+                new RepoManager(), new ServiceCollection().BuildServiceProvider(), new StubDemoService());
+            var group = svc.Organization.Groups[0];
+            Assert.False(group.UnpinnedCollapsed);
+
+            svc.ToggleUnpinnedCollapsed(group.Id);
+            Assert.True(group.UnpinnedCollapsed);
+
+            svc.ToggleUnpinnedCollapsed(group.Id);
+            Assert.False(group.UnpinnedCollapsed);
+
             svc.FlushSaveOrganization();
         }
         finally

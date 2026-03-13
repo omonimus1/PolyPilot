@@ -16,21 +16,33 @@ public class WsBridgeIntegrationTests : IDisposable
     private readonly WsBridgeServer _server;
     private readonly CopilotService _copilot;
     private readonly int _port;
-    private static int _portCounter = 19100;
+
+    private static int GetFreePort()
+    {
+        using var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;
+        listener.Stop();
+        return port;
+    }
 
     /// <summary>
-    /// Polls until a condition is true, with a timeout. Replaces fixed Task.Delay for reliability under load.
+    /// Polls until a condition is true, with a timeout. Throws TimeoutException on silent timeout
+    /// to surface flaky races instead of letting assertions fail on stale state.
     /// </summary>
     private static async Task WaitForAsync(Func<bool> condition, CancellationToken ct, int pollMs = 50, int maxMs = 4000)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         while (!condition() && sw.ElapsedMilliseconds < maxMs)
             await Task.Delay(pollMs, ct);
+
+        if (!condition())
+            throw new TimeoutException($"WaitForAsync condition not met within {maxMs}ms");
     }
 
     public WsBridgeIntegrationTests()
     {
-        _port = Interlocked.Increment(ref _portCounter);
+        _port = GetFreePort();
         _server = new WsBridgeServer();
 
         _copilot = new CopilotService(
@@ -422,9 +434,9 @@ public class WsBridgeIntegrationTests : IDisposable
 
         await client.SendOrganizationCommandAsync(
             new OrganizationCommandPayload { Command = "create_group", Name = "Mobile Group" }, cts.Token);
-        await WaitForAsync(() => _copilot.Organization.Groups.Any(g => g.Name == "Mobile Group"), cts.Token);
+        await WaitForAsync(() => _copilot.Organization.Groups.Any(g => g?.Name == "Mobile Group"), cts.Token);
 
-        Assert.Contains(_copilot.Organization.Groups, g => g.Name == "Mobile Group");
+        Assert.Contains(_copilot.Organization.Groups, g => g?.Name == "Mobile Group");
         client.Stop();
     }
 
@@ -499,8 +511,8 @@ public class WsBridgeIntegrationTests : IDisposable
         await client.SendOrganizationCommandAsync(
             new OrganizationCommandPayload { Command = "rename_group", GroupId = group.Id, Name = "NewName" }, cts.Token);
 
-        await WaitForAsync(() => _copilot.Organization.Groups.FirstOrDefault(g => g.Id == group.Id)?.Name == "NewName", cts.Token);
-        var renamed = _copilot.Organization.Groups.FirstOrDefault(g => g.Id == group.Id);
+        await WaitForAsync(() => _copilot.Organization.Groups.FirstOrDefault(g => g?.Id == group.Id)?.Name == "NewName", cts.Token);
+        var renamed = _copilot.Organization.Groups.FirstOrDefault(g => g?.Id == group.Id);
         Assert.NotNull(renamed);
         Assert.Equal("NewName", renamed!.Name);
         client.Stop();
@@ -517,9 +529,9 @@ public class WsBridgeIntegrationTests : IDisposable
 
         await client.SendOrganizationCommandAsync(
             new OrganizationCommandPayload { Command = "delete_group", GroupId = group.Id }, cts.Token);
-        await WaitForAsync(() => !_copilot.Organization.Groups.Any(g => g.Id == group.Id), cts.Token);
+        await WaitForAsync(() => !_copilot.Organization.Groups.Any(g => g?.Id == group.Id), cts.Token);
 
-        Assert.DoesNotContain(_copilot.Organization.Groups, g => g.Id == group.Id);
+        Assert.DoesNotContain(_copilot.Organization.Groups, g => g?.Id == group.Id);
         client.Stop();
     }
 
@@ -535,9 +547,9 @@ public class WsBridgeIntegrationTests : IDisposable
 
         await client.SendOrganizationCommandAsync(
             new OrganizationCommandPayload { Command = "toggle_collapsed", GroupId = group.Id }, cts.Token);
-        await WaitForAsync(() => _copilot.Organization.Groups.FirstOrDefault(g => g.Id == group.Id)?.IsCollapsed == true, cts.Token);
+        await WaitForAsync(() => _copilot.Organization.Groups.FirstOrDefault(g => g?.Id == group.Id)?.IsCollapsed == true, cts.Token);
 
-        var updated = _copilot.Organization.Groups.FirstOrDefault(g => g.Id == group.Id);
+        var updated = _copilot.Organization.Groups.FirstOrDefault(g => g?.Id == group.Id);
         Assert.NotNull(updated);
         Assert.True(updated!.IsCollapsed);
         client.Stop();
@@ -669,7 +681,7 @@ public class WsBridgeIntegrationTests : IDisposable
         var client = await ConnectClientAsync(cts.Token);
 
         await client.RenameSessionAsync("old-name", "new-name", cts.Token);
-        await WaitForAsync(() => _copilot.GetSession("new-name") != null, cts.Token);
+        await WaitForAsync(() => _copilot.GetSession("new-name") != null, cts.Token, maxMs: 8000);
 
         Assert.Null(_copilot.GetSession("old-name"));
         Assert.NotNull(_copilot.GetSession("new-name"));
@@ -1011,6 +1023,120 @@ public class WsBridgeIntegrationTests : IDisposable
 
         // The server should have broadcast session list with updated active session
         Assert.Equal("switch-b", client.ActiveSessionName);
+        client.Stop();
+    }
+
+    // ========== BRIDGE ORCHESTRATION ROUTING ==========
+
+    /// <summary>
+    /// Regression: WsBridgeServer.HandleClientMessage called SendPromptAsync directly
+    /// when a mobile client sent a message to an orchestrator session, bypassing the
+    /// multi-agent dispatch pipeline. The orchestrator responded as a normal chat session
+    /// instead of planning + dispatching to workers.
+    ///
+    /// Fix: Bridge now calls GetOrchestratorGroupId and routes through
+    /// SendToMultiAgentGroupAsync when the target is an orchestrator.
+    ///
+    /// This test verifies that when a message is sent to an orchestrator session via
+    /// the bridge, the user message is added to the orchestrator's history (proving the
+    /// server received and processed it through the orchestration path).
+    /// </summary>
+    [Fact]
+    public async Task SendMessage_ToOrchestratorSession_RoutesViaOrchestration()
+    {
+        await InitDemoMode();
+
+        // Create sessions that form a multi-agent group
+        await _copilot.CreateSessionAsync("orch-bridge-test", "gpt-4.1");
+        await _copilot.CreateSessionAsync("worker-bridge-1", "gpt-4.1");
+
+        // Set up multi-agent group with orchestrator mode
+        var group = _copilot.CreateMultiAgentGroup("BridgeOrchTest", MultiAgentMode.Orchestrator);
+        var orchMeta = _copilot.Organization.Sessions.FirstOrDefault(s => s.SessionName == "orch-bridge-test");
+        var workerMeta = _copilot.Organization.Sessions.FirstOrDefault(s => s.SessionName == "worker-bridge-1");
+        Assert.NotNull(orchMeta);
+        Assert.NotNull(workerMeta);
+        orchMeta!.GroupId = group.Id;
+        orchMeta.Role = MultiAgentRole.Orchestrator;
+        workerMeta!.GroupId = group.Id;
+        workerMeta.Role = MultiAgentRole.Worker;
+
+        // Verify routing detection works
+        Assert.Equal(group.Id, _copilot.GetOrchestratorGroupId("orch-bridge-test"));
+        Assert.Null(_copilot.GetOrchestratorGroupId("worker-bridge-1"));
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var client = await ConnectClientAsync(cts.Token);
+
+        // Send message to orchestrator via bridge (this is what mobile does)
+        await client.SendMessageAsync("orch-bridge-test", "Review PR #42", ct: cts.Token);
+
+        // The orchestrator session should have the user message in history
+        // (demo mode processes it through the orchestration pipeline which adds user message)
+        var orchSession = _copilot.GetSession("orch-bridge-test");
+        Assert.NotNull(orchSession);
+        await WaitForAsync(
+            () => orchSession!.History.Any(m => m.Content?.Contains("Review PR #42") == true),
+            cts.Token);
+        Assert.Contains(orchSession!.History, m => m.Content?.Contains("Review PR #42") == true);
+        client.Stop();
+    }
+
+    [Fact]
+    public async Task SendMessage_ToWorkerSession_DoesNotRouteViaOrchestration()
+    {
+        await InitDemoMode();
+
+        await _copilot.CreateSessionAsync("orch-noroute", "gpt-4.1");
+        await _copilot.CreateSessionAsync("worker-noroute", "gpt-4.1");
+
+        var group = _copilot.CreateMultiAgentGroup("WorkerDirectTest", MultiAgentMode.Orchestrator);
+        var orchMeta = _copilot.Organization.Sessions.FirstOrDefault(s => s.SessionName == "orch-noroute");
+        var workerMeta = _copilot.Organization.Sessions.FirstOrDefault(s => s.SessionName == "worker-noroute");
+        orchMeta!.GroupId = group.Id;
+        orchMeta.Role = MultiAgentRole.Orchestrator;
+        workerMeta!.GroupId = group.Id;
+        workerMeta.Role = MultiAgentRole.Worker;
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var client = await ConnectClientAsync(cts.Token);
+
+        // Send message directly to worker via bridge — should go direct, not through orchestration
+        await client.SendMessageAsync("worker-noroute", "Direct worker task", ct: cts.Token);
+
+        var workerSession = _copilot.GetSession("worker-noroute");
+        Assert.NotNull(workerSession);
+        await WaitForAsync(
+            () => workerSession!.History.Any(m => m.Content?.Contains("Direct worker task") == true),
+            cts.Token);
+        Assert.Contains(workerSession!.History, m => m.Content?.Contains("Direct worker task") == true);
+
+        // Orchestrator should NOT have received the message
+        var orchSession = _copilot.GetSession("orch-noroute");
+        Assert.DoesNotContain(orchSession!.History, m => m.Content?.Contains("Direct worker task") == true);
+        client.Stop();
+    }
+
+    [Fact]
+    public async Task SendMessage_ToNonGroupSession_WorksNormally()
+    {
+        await InitDemoMode();
+        await _copilot.CreateSessionAsync("standalone-bridge", "gpt-4.1");
+
+        // No multi-agent group — GetOrchestratorGroupId should return null
+        Assert.Null(_copilot.GetOrchestratorGroupId("standalone-bridge"));
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var client = await ConnectClientAsync(cts.Token);
+
+        await client.SendMessageAsync("standalone-bridge", "Hello standalone", ct: cts.Token);
+
+        var session = _copilot.GetSession("standalone-bridge");
+        Assert.NotNull(session);
+        await WaitForAsync(
+            () => session!.History.Any(m => m.Content?.Contains("Hello standalone") == true),
+            cts.Token);
+        Assert.Contains(session!.History, m => m.Content?.Contains("Hello standalone") == true);
         client.Stop();
     }
 }

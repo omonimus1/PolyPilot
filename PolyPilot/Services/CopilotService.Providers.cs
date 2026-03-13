@@ -1,14 +1,19 @@
+using System.Collections.Concurrent;
 using Microsoft.Extensions.DependencyInjection;
 using PolyPilot.Models;
 using PolyPilot.Provider;
 
 namespace PolyPilot.Services;
 
+/// <summary>DTO for serializing provider actions to JS with named properties.
+/// ValueTuple serializes as Item1/Item2; this record uses camelCase-friendly names.</summary>
+public record ProviderCommandDto(string ProviderId, string Id, string Label, string? Tooltip);
+
 public partial class CopilotService
 {
     // ── Provider State ──────────────────────────────────────
-    private readonly Dictionary<string, ISessionProvider> _providers = new();
-    private readonly Dictionary<string, string> _sessionToProviderId = new();
+    private readonly ConcurrentDictionary<string, ISessionProvider> _providers = new();
+    private readonly ConcurrentDictionary<string, string> _sessionToProviderId = new();
 
     /// <summary>
     /// Resolves all ISessionProvider instances from DI, registers them into the session model,
@@ -18,13 +23,23 @@ public partial class CopilotService
     {
         if (_serviceProvider == null) return;
 
-        IEnumerable<ISessionProvider> providers;
+        List<ISessionProvider> providers;
         try
         {
-            providers = _serviceProvider.GetServices<ISessionProvider>();
+            // Materialize eagerly so DI construction errors are caught here
+            providers = _serviceProvider.GetServices<ISessionProvider>().ToList();
+            Debug($"Resolved {providers.Count} ISessionProvider(s) from DI");
         }
-        catch
+        catch (Exception ex)
         {
+            Debug($"Failed to resolve ISessionProvider services: {ex}");
+            // Also log to plugin system log for visibility
+            try
+            {
+                var systemLog = new PluginFileLogger("_system");
+                systemLog.Error($"DI resolution of ISessionProvider failed: {ex}");
+            }
+            catch { }
             return;
         }
 
@@ -32,14 +47,30 @@ public partial class CopilotService
         {
             _providers[provider.ProviderId] = provider;
             RegisterProvider(provider);
+            Debug($"Provider '{provider.ProviderId}' ({provider.DisplayName}) registered");
 
             try
             {
                 await provider.InitializeAsync(ct);
+                Debug($"Provider '{provider.ProviderId}' initialized successfully");
+
+                // Re-sync members after init — the initial sync during RegisterProvider
+                // runs before the provider has loaded its agents
+                var groupId = $"__provider_{provider.ProviderId}__";
+                SyncProviderMembers(provider, groupId);
+                var memberCount = provider.GetMembers().Count;
+                Debug($"Provider '{provider.ProviderId}' has {memberCount} member(s) after init");
             }
             catch (Exception ex)
             {
                 Debug($"Provider '{provider.ProviderId}' init failed: {ex.Message}");
+                // Log to plugin system log
+                try
+                {
+                    var systemLog = new PluginFileLogger("_system");
+                    systemLog.Error($"Provider '{provider.ProviderId}' init failed: {ex}");
+                }
+                catch { }
             }
         }
     }
@@ -62,7 +93,7 @@ public partial class CopilotService
                 IsMultiAgent = false,
                 SortOrder = Organization.Groups.Any() ? Organization.Groups.Max(g => g.SortOrder) + 1 : 0
             };
-            Organization.Groups.Add(group);
+            AddGroup(group);
         }
         else
         {
@@ -88,7 +119,7 @@ public partial class CopilotService
                     GroupId = groupId,
                     IsPinned = true
                 };
-                Organization.Sessions.Add(leaderMeta);
+                AddSessionMeta(leaderMeta);
             }
 
             _sessions[leaderName] = new SessionState
@@ -191,6 +222,8 @@ public partial class CopilotService
                 state.Info.IsProcessing = false;
                 state.Info.ProcessingStartedAt = null;
                 state.Info.ProcessingPhase = 0;
+                state.Info.ToolCallCount = 0;
+                state.Info.IsResumed = false;
             }
             OnTurnEnd?.Invoke(sessionName);
             OnStateChanged?.Invoke();
@@ -200,9 +233,19 @@ public partial class CopilotService
         {
             if (_sessions.TryGetValue(sessionName, out var state))
             {
+                // Flush any partial content before clearing state
+                if (state.CurrentResponse.Length > 0)
+                {
+                    var responseText = state.CurrentResponse.ToString();
+                    state.Info.History.Add(ChatMessage.AssistantMessage(responseText));
+                    state.Info.MessageCount = state.Info.History.Count;
+                    state.CurrentResponse.Clear();
+                }
                 state.Info.IsProcessing = false;
                 state.Info.ProcessingStartedAt = null;
                 state.Info.ProcessingPhase = 0;
+                state.Info.ToolCallCount = 0;
+                state.Info.IsResumed = false;
             }
             OnError?.Invoke(sessionName, error);
             OnStateChanged?.Invoke();
@@ -265,6 +308,8 @@ public partial class CopilotService
                 state.Info.IsProcessing = false;
                 state.Info.ProcessingStartedAt = null;
                 state.Info.ProcessingPhase = 0;
+                state.Info.ToolCallCount = 0;
+                state.Info.IsResumed = false;
             }
             OnTurnEnd?.Invoke(sessionName);
             OnStateChanged?.Invoke();
@@ -275,9 +320,18 @@ public partial class CopilotService
             var sessionName = $"{prefix}{memberId}{suffix}";
             if (_sessions.TryGetValue(sessionName, out var state))
             {
+                if (state.CurrentResponse.Length > 0)
+                {
+                    var responseText = state.CurrentResponse.ToString();
+                    state.Info.History.Add(ChatMessage.AssistantMessage(responseText));
+                    state.Info.MessageCount = state.Info.History.Count;
+                    state.CurrentResponse.Clear();
+                }
                 state.Info.IsProcessing = false;
                 state.Info.ProcessingStartedAt = null;
                 state.Info.ProcessingPhase = 0;
+                state.Info.ToolCallCount = 0;
+                state.Info.IsResumed = false;
             }
             OnError?.Invoke(sessionName, error);
             OnStateChanged?.Invoke();
@@ -303,9 +357,9 @@ public partial class CopilotService
             .ToList())
         {
             _sessions.TryRemove(existing, out _);
-            _sessionToProviderId.Remove(existing);
+            _sessionToProviderId.TryRemove(existing, out _);
             var meta = Organization.Sessions.FirstOrDefault(m => m.SessionName == existing);
-            if (meta != null) Organization.Sessions.Remove(meta);
+            if (meta != null) RemoveSessionMeta(meta);
         }
 
         // Upsert member sessions
@@ -329,7 +383,7 @@ public partial class CopilotService
                         GroupId = groupId,
                         Role = MultiAgentRole.Worker
                     };
-                    Organization.Sessions.Add(meta);
+                    AddSessionMeta(meta);
                 }
 
                 _sessions[name] = new SessionState
@@ -407,6 +461,54 @@ public partial class CopilotService
     public ISessionProvider? GetProviderForSession(string sessionName) =>
         _sessionToProviderId.TryGetValue(sessionName, out var id) &&
         _providers.TryGetValue(id, out var p) ? p : null;
+
+    /// <summary>
+    /// Returns all provider actions available for the given session's provider, or empty if not a provider session.
+    /// Actions are returned with their provider reference for execution.
+    /// </summary>
+    public IReadOnlyList<(ISessionProvider Provider, ProviderAction Action)> GetProviderActionsForSession(string sessionName)
+    {
+        var provider = GetProviderForSession(sessionName);
+        if (provider == null) return [];
+        return provider.GetActions().Select(a => (provider, a)).ToList();
+    }
+
+    /// <summary>
+    /// Returns all provider actions across all registered providers.
+    /// Each action is prefixed with the provider's display name for disambiguation.
+    /// </summary>
+    public IReadOnlyList<(string ProviderId, ProviderAction Action)> GetAllProviderActions()
+    {
+        var result = new List<(string, ProviderAction)>();
+        foreach (var (id, provider) in _providers)
+        {
+            foreach (var action in provider.GetActions())
+                result.Add((id, action));
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Returns all provider actions as DTOs suitable for JSON serialization to JS.
+    /// Uses named properties (ProviderId, Id, Label, Tooltip) instead of ValueTuple Item1/Item2.
+    /// </summary>
+    public IReadOnlyList<ProviderCommandDto> GetAllProviderCommandDtos()
+    {
+        var result = new List<ProviderCommandDto>();
+        foreach (var (id, provider) in _providers)
+            foreach (var action in provider.GetActions())
+                result.Add(new ProviderCommandDto(id, action.Id, action.Label, action.Tooltip));
+        return result;
+    }
+
+    /// <summary>
+    /// Executes a provider action looked up by provider ID. Called from the JS slash-command bridge.
+    /// </summary>
+    public async Task ExecuteProviderSlashCommandAsync(string providerId, string actionId)
+    {
+        if (_providers.TryGetValue(providerId, out var provider))
+            await ExecuteProviderActionAsync(provider, actionId);
+    }
 
     /// <summary>
     /// Returns a human-readable display name for a provider session.

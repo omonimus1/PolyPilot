@@ -286,6 +286,21 @@ public partial class CopilotService
         s.Length <= max ? s : s[..max] + "…";
 
     /// <summary>
+    /// Observes a fire-and-forget <see cref="Task"/> so that any faulted exception
+    /// is logged instead of surfacing as <see cref="TaskScheduler.UnobservedTaskException"/>.
+    /// All ChatDatabase write-through calls use this wrapper.
+    /// </summary>
+    internal static void SafeFireAndForget(Task task, string context = "")
+    {
+        if (task.IsCompletedSuccessfully) return;
+        task.ContinueWith(static (t, state) =>
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"[SafeFireAndForget] {state}: {t.Exception?.GetBaseException().Message}");
+        }, context, TaskContinuationOptions.OnlyOnFaulted);
+    }
+
+    /// <summary>
     /// Returns true if the exception indicates a broken connection
     /// (JSON-RPC lost, socket closed, transport error, etc.).
     /// Used by CreateSessionAsync retry logic and session restore.
@@ -300,7 +315,8 @@ public partial class CopilotService
             || msg.Contains("connection lost", StringComparison.OrdinalIgnoreCase)
             || msg.Contains("transport connection", StringComparison.OrdinalIgnoreCase)
             || msg.Contains("transport is closed", StringComparison.OrdinalIgnoreCase)
-            || msg.Contains("JSON-RPC connection", StringComparison.OrdinalIgnoreCase))
+            || msg.Contains("JSON-RPC connection", StringComparison.OrdinalIgnoreCase)
+            || msg.Contains("not connected", StringComparison.OrdinalIgnoreCase))
             return true;
         // Walk the full exception chain, including all AggregateException inner exceptions
         if (ex is AggregateException agg)
